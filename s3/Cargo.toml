@@ -84,7 +84,7 @@ tokio-stream = { version = "0.1", optional = true }
 url = "2"
 
 [features]
-default = ["fail-on-err", "tags", "tokio-native-tls"]
+default = ["fail-on-err", "tags", "tokio-native-tls", "http-credentials-native-tls"]
 
 sync = ["attohttpc", "maybe-async/is_sync"]
 with-async-std-hyper = ["with-async-std", "surf/hyper-client"]
@@ -95,21 +95,20 @@ blocking = ["block_on_proc", "tokio/rt", "tokio/rt-multi-thread"]
 fail-on-err = []
 tags = ["minidom"]
 
+# Fetching credentials over HTTP (STS web identity, ECS, EC2 instance metadata) is separate
+# from the HTTP client used for S3: `http-credentials` alone speaks plain HTTP through attohttpc,
+# the `-tls` variants add HTTPS for STS. The `tokio-*` and `async-std-*` client features no longer
+# imply them, so a build that gets its credentials from the environment or a profile links
+# neither attohttpc nor a second TLS stack.
 http-credentials = ["aws-creds/http-credentials"]
+http-credentials-native-tls = ["aws-creds/native-tls"]
+http-credentials-rustls-tls = ["aws-creds/rustls-tls"]
 
-tokio-native-tls = ["aws-creds/native-tls", "reqwest/native-tls", "with-tokio"]
-tokio-rustls-tls = ["aws-creds/rustls-tls", "reqwest/rustls-tls", "with-tokio"]
+tokio-native-tls = ["reqwest/native-tls", "with-tokio"]
+tokio-rustls-tls = ["reqwest/rustls-tls", "with-tokio"]
 
-async-std-native-tls = [
-    "aws-creds/native-tls",
-    "with-async-std",
-    "surf/h1-client",
-]
-async-std-rustls-tls = [
-    "aws-creds/rustls-tls",
-    "with-async-std",
-    "surf/h1-client-rustls",
-]
+async-std-native-tls = ["with-async-std", "surf/h1-client"]
+async-std-rustls-tls = ["with-async-std", "surf/h1-client-rustls"]
 
 sync-native-tls = ["attohttpc/tls", "aws-creds/native-tls", "sync"]
 sync-native-tls-vendored = [
