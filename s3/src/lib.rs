@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 //! Simple access to Amazon Web Service's (AWS) Simple Storage Service (S3)
 #![forbid(unsafe_code)]
 
@@ -8,10 +10,16 @@ use std::sync::atomic::AtomicU8;
 
 pub use awscreds as creds;
 pub use awsregion as region;
+/// This crate's reqwest, re-exported so that a [`RequestObserver`] outside it can name the
+/// request, response and error types it is handed even when it depends on another reqwest.
+#[cfg(feature = "with-tokio")]
+pub use reqwest;
 
 pub use bucket::Bucket;
 pub use bucket::Tag;
 pub use bucket_ops::BucketConfiguration;
+#[cfg(feature = "with-tokio")]
+pub use observer::{BodyEnd, BodyObserver, RequestObserver, set_request_observer};
 pub use post_policy::{PostPolicy, PostPolicyChecksum, PostPolicyField, PostPolicyValue};
 pub use put_object_request::PutObjectRequest;
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
@@ -22,6 +30,8 @@ pub mod bucket;
 pub mod bucket_ops;
 pub mod command;
 pub mod deserializer;
+#[cfg(feature = "with-tokio")]
+pub mod observer;
 pub mod post_policy;
 pub mod put_object_request;
 pub mod serde_types;

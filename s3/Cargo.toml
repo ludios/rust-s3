@@ -118,7 +118,7 @@ sync-native-tls-vendored = [
 sync-rustls-tls = ["attohttpc/tls-rustls", "aws-creds/rustls-tls", "sync"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "net", "io-util", "time", "sync"] }
 async-std = { version = "1", features = ["attributes"] }
 uuid = { version = "1", features = ["v4"] }
 env_logger = "0.11"
