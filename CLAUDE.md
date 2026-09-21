@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+For guidance on how to program and make commits, AGENTS.md takes precedence over anything here.
+
 ## Repository Overview
 
 rust-s3 is a Rust library for working with Amazon S3 and S3-compatible object storage APIs (Minio, Wasabi, GCS, R2, etc.). It's a workspace project with three main crates:
