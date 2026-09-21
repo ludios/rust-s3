@@ -5,10 +5,14 @@ extern crate base64;
 extern crate md5;
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{Stream, TryStreamExt};
 use maybe_async::maybe_async;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::str::FromStr as _;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::task::{Context, Poll, ready};
+use std::time::Instant;
 use time::OffsetDateTime;
 
 use super::request_trait::{Request, ResponseData, ResponseDataStream};
@@ -16,6 +20,8 @@ use crate::bucket::Bucket;
 use crate::command::Command;
 use crate::command::HttpMethod;
 use crate::error::S3Error;
+use crate::observer::{BodyEnd, BodyObserver, request_observer};
+use crate::request::RequestAttemptError;
 use crate::utils::now_utc;
 
 use tokio_stream::StreamExt;
@@ -72,6 +78,11 @@ pub(crate) fn client(options: &ClientOptions) -> Result<reqwest::Client, S3Error
 
     Ok(client.build()?)
 }
+
+/// Hands out the `op` numbers that tell a `RequestObserver` one request's attempts apart from
+/// another's. Starts at 1 so that 0 never means a real request.
+static NEXT_OP: AtomicU64 = AtomicU64::new(1);
+
 // Temporary structure for making a request
 pub struct ReqwestRequest<'a> {
     pub bucket: &'a Bucket,
@@ -79,13 +90,101 @@ pub struct ReqwestRequest<'a> {
     pub command: Command<'a>,
     pub datetime: OffsetDateTime,
     pub sync: bool,
+    /// Identifies this request to the `RequestObserver` across all of its attempts.
+    op: u64,
+    /// How many times this request has been handed to reqwest so far.
+    attempts: AtomicU32,
+}
+
+/// A response whose headers have arrived, with the observer that is to see its body.
+type ObservedResponse = (reqwest::Response, Option<Box<dyn BodyObserver>>);
+
+/// The body stream of one response, teed into its `BodyObserver`. Every body the backend reads
+/// goes through this, whether or not an observer is set, so there is one code path.
+///
+/// The observer is taken out of its `Option` before `end` is called, which is what makes `end`
+/// run at most once, `Drop` included.
+struct ObservedBody {
+    stream: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    observer: Option<Box<dyn BodyObserver>>,
+}
+
+impl ObservedBody {
+    fn new(response: reqwest::Response, observer: Option<Box<dyn BodyObserver>>) -> Self {
+        Self {
+            stream: Box::pin(response.bytes_stream()),
+            observer,
+        }
+    }
+}
+
+impl Stream for ObservedBody {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = ready!(self.stream.as_mut().poll_next(cx));
+        match &item {
+            Some(Ok(bytes)) => {
+                if let Some(observer) = &mut self.observer {
+                    observer.chunk(bytes);
+                }
+            }
+            Some(Err(error)) => {
+                if let Some(observer) = self.observer.take() {
+                    observer.end(BodyEnd::Error(error));
+                }
+            }
+            None => {
+                if let Some(observer) = self.observer.take() {
+                    observer.end(BodyEnd::Eof);
+                }
+            }
+        }
+        Poll::Ready(item)
+    }
+}
+
+impl Drop for ObservedBody {
+    /// Reports a body that was let go before its end was seen. Never polls or drains: the
+    /// consumer's decision to stop reading is what is being reported.
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer.take() {
+            observer.end(BodyEnd::Dropped);
+        }
+    }
+}
+
+/// Reads `body` to its end. Unlike `Response::bytes`, a read that fails midway has already
+/// handed the observer the bytes that did arrive.
+async fn collect(mut body: ObservedBody) -> Result<Vec<u8>, S3Error> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    Ok(bytes)
+}
+
+/// The error `fail-on-err` reports for a non-2xx response: its status and its body, decoded
+/// lossily as `Response::text` does, retryable or not by status. A body that cannot be read
+/// yields that read's error instead, which is never retried.
+async fn http_fail_with_body(
+    response: reqwest::Response,
+    observer: Option<Box<dyn BodyObserver>>,
+) -> RequestAttemptError {
+    let status = response.status().as_u16();
+    match collect(ObservedBody::new(response, observer)).await {
+        Ok(body) => {
+            S3Error::HttpFailWithBody(status, String::from_utf8_lossy(&body).into_owned()).into()
+        }
+        Err(error) => RequestAttemptError::do_not_retry(error),
+    }
 }
 
 /// Builds the signed request and sends it once, without retrying or looking at the status.
 /// Returns as soon as the response headers have arrived; the body is unread.
-async fn execute(
-    request: &ReqwestRequest<'_>,
-) -> Result<reqwest::Response, crate::request::RequestAttemptError> {
+/// The installed `RequestObserver`, if any, sees the attempt and may attach a body
+/// observer to the response.
+async fn execute(request: &ReqwestRequest<'_>) -> Result<ObservedResponse, RequestAttemptError> {
     let headers = request
         .headers()
         .await?
@@ -118,25 +217,35 @@ async fn execute(
     } else {
         request_builder
     };
-    Ok(client.execute(request_builder.build()?).await?)
+    let built = request_builder.build()?;
+
+    // A request that failed to build above consumed no attempt number. The observer is
+    // read once so that both callbacks of an attempt go to the same one.
+    let observer = request_observer();
+    let attempt = request.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(observer) = observer {
+        observer.on_request(request.op, attempt, request.bucket, &built);
+    }
+    let started = Instant::now();
+    let result = client.execute(built).await;
+    let body_observer = observer.and_then(|observer| {
+        observer.on_response(request.op, attempt, started.elapsed(), result.as_ref())
+    });
+    Ok((result?, body_observer))
 }
 
 /// `execute` plus the `fail-on-err` policy: a non-2xx response becomes an error carrying
-/// the body.
+/// the body, which the body observer sees being read.
 async fn request_response_attempt(
     request: &ReqwestRequest<'_>,
-) -> Result<reqwest::Response, crate::request::RequestAttemptError> {
-    let response = execute(request).await?;
+) -> Result<ObservedResponse, RequestAttemptError> {
+    let (response, observer) = execute(request).await?;
 
     if cfg!(feature = "fail-on-err") && !response.status().is_success() {
-        let status = response.status().as_u16();
-        let text = response.text().await.map_err(|error| {
-            crate::request::RequestAttemptError::do_not_retry(S3Error::Reqwest(error))
-        })?;
-        return Err(S3Error::HttpFailWithBody(status, text).into());
+        return Err(http_fail_with_body(response, observer).await);
     }
 
-    Ok(response)
+    Ok((response, observer))
 }
 
 #[maybe_async]
@@ -144,15 +253,17 @@ impl<'a> Request for ReqwestRequest<'a> {
     type Response = reqwest::Response;
     type HeaderMap = reqwest::header::HeaderMap;
 
+    /// The raw response. Whatever the caller reads of its body goes unobserved.
     async fn response(&self) -> Result<Self::Response, S3Error> {
         request_response_attempt(self)
             .await
+            .map(|(response, _)| response)
             .map_err(|error| error.error)
     }
 
     async fn response_status(&self) -> Result<u16, S3Error> {
         crate::request::retry_request(&self.command, || async {
-            let response = execute(self).await?;
+            let (response, observer) = execute(self).await?;
             let status = response.status().as_u16();
 
             if status == 404 {
@@ -160,10 +271,7 @@ impl<'a> Request for ReqwestRequest<'a> {
             }
 
             if cfg!(feature = "fail-on-err") && !response.status().is_success() {
-                let text = response.text().await.map_err(|error| {
-                    crate::request::RequestAttemptError::do_not_retry(S3Error::Reqwest(error))
-                })?;
-                return Err(S3Error::HttpFailWithBody(status, text).into());
+                return Err(http_fail_with_body(response, observer).await);
             }
 
             Ok(status)
@@ -172,7 +280,7 @@ impl<'a> Request for ReqwestRequest<'a> {
     }
 
     async fn response_data(&self, etag: bool) -> Result<ResponseData, S3Error> {
-        let response =
+        let (response, observer) =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
         let status_code = response.status().as_u16();
         let mut headers = response.headers().clone();
@@ -207,7 +315,7 @@ impl<'a> Request for ReqwestRequest<'a> {
                 Bytes::from("")
             }
         } else {
-            response.bytes().await?
+            Bytes::from(collect(ObservedBody::new(response, observer)).await?)
         };
         Ok(ResponseData::new(body_vec, status_code, response_headers))
     }
@@ -217,11 +325,11 @@ impl<'a> Request for ReqwestRequest<'a> {
         writer: &mut T,
     ) -> Result<u16, S3Error> {
         use tokio::io::AsyncWriteExt;
-        let response =
+        let (response, observer) =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
 
         let status_code = response.status();
-        let mut stream = response.bytes_stream();
+        let mut stream = ObservedBody::new(response, observer);
 
         while let Some(item) = stream.next().await {
             writer.write_all(&item?).await?;
@@ -231,10 +339,10 @@ impl<'a> Request for ReqwestRequest<'a> {
     }
 
     async fn response_data_to_stream(&self) -> Result<ResponseDataStream, S3Error> {
-        let response =
+        let (response, observer) =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
         let status_code = response.status();
-        let stream = response.bytes_stream().map_err(S3Error::Reqwest);
+        let stream = ObservedBody::new(response, observer).map_err(S3Error::Reqwest);
 
         Ok(ResponseDataStream {
             bytes: Box::pin(stream),
@@ -243,7 +351,7 @@ impl<'a> Request for ReqwestRequest<'a> {
     }
 
     async fn response_header(&self) -> Result<(Self::HeaderMap, u16), S3Error> {
-        let response =
+        let (response, _) =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
         let status_code = response.status().as_u16();
         let headers = response.headers().clone();
@@ -280,6 +388,8 @@ impl<'a> ReqwestRequest<'a> {
             command,
             datetime: now_utc(),
             sync: false,
+            op: NEXT_OP.fetch_add(1, Ordering::Relaxed),
+            attempts: AtomicU32::new(0),
         })
     }
 }
