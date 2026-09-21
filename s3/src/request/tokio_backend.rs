@@ -1,3 +1,6 @@
+// Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
+
 extern crate base64;
 extern crate md5;
 
@@ -78,7 +81,9 @@ pub struct ReqwestRequest<'a> {
     pub sync: bool,
 }
 
-async fn request_response_attempt(
+/// Builds the signed request and sends it once, without retrying or looking at the status.
+/// Returns as soon as the response headers have arrived; the body is unread.
+async fn execute(
     request: &ReqwestRequest<'_>,
 ) -> Result<reqwest::Response, crate::request::RequestAttemptError> {
     let headers = request
@@ -113,7 +118,15 @@ async fn request_response_attempt(
     } else {
         request_builder
     };
-    let response = client.execute(request_builder.build()?).await?;
+    Ok(client.execute(request_builder.build()?).await?)
+}
+
+/// `execute` plus the `fail-on-err` policy: a non-2xx response becomes an error carrying
+/// the body.
+async fn request_response_attempt(
+    request: &ReqwestRequest<'_>,
+) -> Result<reqwest::Response, crate::request::RequestAttemptError> {
+    let response = execute(request).await?;
 
     if cfg!(feature = "fail-on-err") && !response.status().is_success() {
         let status = response.status().as_u16();
@@ -139,43 +152,7 @@ impl<'a> Request for ReqwestRequest<'a> {
 
     async fn response_status(&self) -> Result<u16, S3Error> {
         crate::request::retry_request(&self.command, || async {
-            let headers = self
-                .headers()
-                .await?
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        reqwest::header::HeaderName::from_str(k.as_str()),
-                        reqwest::header::HeaderValue::from_str(v.to_str().unwrap_or_default()),
-                    )
-                })
-                .filter(|(k, v)| k.is_ok() && v.is_ok())
-                .map(|(k, v)| (k.unwrap(), v.unwrap()))
-                .collect();
-
-            let client = self.bucket.http_client();
-
-            let method = match self.command.http_verb() {
-                HttpMethod::Delete => reqwest::Method::DELETE,
-                HttpMethod::Get => reqwest::Method::GET,
-                HttpMethod::Post => reqwest::Method::POST,
-                HttpMethod::Put => reqwest::Method::PUT,
-                HttpMethod::Head => reqwest::Method::HEAD,
-            };
-
-            let request = client
-                .request(method, self.url()?.as_str())
-                .headers(headers)
-                .body(self.request_body()?);
-
-            let request = if let Some(timeout) = self.bucket.request_timeout {
-                request.timeout(timeout)
-            } else {
-                request
-            };
-
-            let request = request.build()?;
-            let response = client.execute(request).await.map_err(S3Error::from)?;
+            let response = execute(self).await?;
             let status = response.status().as_u16();
 
             if status == 404 {
