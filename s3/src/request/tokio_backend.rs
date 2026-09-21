@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 extern crate base64;
 extern crate md5;
 
@@ -67,12 +69,25 @@ pub struct ReqwestRequest<'a> {
     pub sync: bool,
 }
 
-#[maybe_async]
-impl<'a> Request for ReqwestRequest<'a> {
-    type Response = reqwest::Response;
-    type HeaderMap = reqwest::header::HeaderMap;
+impl<'a> ReqwestRequest<'a> {
+    pub async fn new(
+        bucket: &'a Bucket,
+        path: &'a str,
+        command: Command<'a>,
+    ) -> Result<ReqwestRequest<'a>, S3Error> {
+        bucket.credentials_refresh().await?;
+        Ok(Self {
+            bucket,
+            path,
+            command,
+            datetime: now_utc(),
+            sync: false,
+        })
+    }
 
-    async fn response(&self) -> Result<Self::Response, S3Error> {
+    /// Builds the signed request and sends it once, without retrying or looking at the
+    /// status. Returns as soon as the response headers have arrived; the body is unread.
+    async fn execute(&self) -> Result<reqwest::Response, S3Error> {
         let headers = self
             .headers()
             .await?
@@ -100,13 +115,22 @@ impl<'a> Request for ReqwestRequest<'a> {
         let request = client
             .request(method, self.url()?.as_str())
             .headers(headers)
-            .body(self.request_body()?);
-
-        let request = request.build()?;
+            .body(self.request_body()?)
+            .build()?;
 
         // println!("Request: {:?}", request);
 
-        let response = client.execute(request).await?;
+        Ok(client.execute(request).await?)
+    }
+}
+
+#[maybe_async]
+impl<'a> Request for ReqwestRequest<'a> {
+    type Response = reqwest::Response;
+    type HeaderMap = reqwest::header::HeaderMap;
+
+    async fn response(&self) -> Result<Self::Response, S3Error> {
+        let response = self.execute().await?;
 
         if cfg!(feature = "fail-on-err") && !response.status().is_success() {
             let status = response.status().as_u16();
@@ -120,37 +144,7 @@ impl<'a> Request for ReqwestRequest<'a> {
     async fn response_status(&self) -> Result<u16, S3Error> {
         retry! {
             async {
-                let headers = self
-                    .headers()
-                    .await?
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            reqwest::header::HeaderName::from_str(k.as_str()),
-                            reqwest::header::HeaderValue::from_str(v.to_str().unwrap_or_default()),
-                        )
-                    })
-                    .filter(|(k, v)| k.is_ok() && v.is_ok())
-                    .map(|(k, v)| (k.unwrap(), v.unwrap()))
-                    .collect();
-
-                let client = self.bucket.http_client();
-
-                let method = match self.command.http_verb() {
-                    HttpMethod::Delete => reqwest::Method::DELETE,
-                    HttpMethod::Get => reqwest::Method::GET,
-                    HttpMethod::Post => reqwest::Method::POST,
-                    HttpMethod::Put => reqwest::Method::PUT,
-                    HttpMethod::Head => reqwest::Method::HEAD,
-                };
-
-                let request = client
-                    .request(method, self.url()?.as_str())
-                    .headers(headers)
-                    .body(self.request_body()?);
-
-                let request = request.build()?;
-                let response = client.execute(request).await?;
+                let response = self.execute().await?;
                 let status = response.status().as_u16();
 
                 if status == 404 {
@@ -256,23 +250,6 @@ impl<'a> Request for ReqwestRequest<'a> {
 
     fn path(&self) -> String {
         self.path.to_string()
-    }
-}
-
-impl<'a> ReqwestRequest<'a> {
-    pub async fn new(
-        bucket: &'a Bucket,
-        path: &'a str,
-        command: Command<'a>,
-    ) -> Result<ReqwestRequest<'a>, S3Error> {
-        bucket.credentials_refresh().await?;
-        Ok(Self {
-            bucket,
-            path,
-            command,
-            datetime: now_utc(),
-            sync: false,
-        })
     }
 }
 
