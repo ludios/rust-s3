@@ -3279,6 +3279,47 @@ impl Bucket {
         Ok((tags, result.status_code()))
     }
 
+    /// The marker that continues a ListObjects v1 listing after `page`: its `NextMarker` or,
+    /// for a truncated page without one, the greatest key or common prefix on it. `None` for
+    /// the last page. Decoded if `page` is URL-encoded, because a marker is sent unencoded.
+    fn next_v1_marker(page: &ListBucketResult) -> Option<String> {
+        let url_encoded = page.encoding_type.as_deref() == Some("url");
+        // S3's URL encoding writes a space as `+`, and a `+` as `%2B`.
+        let decode = |value: &str| {
+            if url_encoded {
+                percent_encoding::percent_decode_str(&value.replace('+', " "))
+                    .decode_utf8_lossy()
+                    .into_owned()
+            } else {
+                value.to_owned()
+            }
+        };
+
+        let next_marker = page.next_continuation_token.as_deref();
+        if let Some(marker) = next_marker.filter(|marker| !marker.is_empty()) {
+            return Some(decode(marker));
+        }
+        if !page.is_truncated {
+            return None;
+        }
+        let last_key = page.contents.last().map(|object| decode(&object.key));
+        let last_prefix = page
+            .common_prefixes
+            .iter()
+            .flatten()
+            .last()
+            .map(|prefix| decode(&prefix.prefix));
+        last_key.max(last_prefix)
+    }
+
+    /// List one page of the objects whose keys begin with `prefix`, grouped into common
+    /// prefixes by `delimiter`, at most `max_keys` of them. Pass the previous page's
+    /// `next_continuation_token` as `continuation_token` to get the page after it;
+    /// `start_after` starts the listing after that key. Returns the page and the HTTP status.
+    ///
+    /// In ListObjects v1 mode, `next_continuation_token` is the page's `NextMarker` or, for a
+    /// truncated page without one (S3 sends it only for a delimited listing), the greatest key
+    /// or common prefix on the page, URL-decoded if the page is URL-encoded.
     #[maybe_async::maybe_async]
     pub async fn list_page(
         &self,
@@ -3309,14 +3350,19 @@ impl Bucket {
         };
         let request = RequestImpl::new(self, "/", command).await?;
         let response_data = request.response_data(false).await?;
-        let list_bucket_result = quick_xml::de::from_reader(response_data.as_slice())?;
+        let mut list_bucket_result: ListBucketResult =
+            quick_xml::de::from_reader(response_data.as_slice())?;
+        if !self.listobjects_v2 {
+            list_bucket_result.next_continuation_token = Self::next_v1_marker(&list_bucket_result);
+        }
 
         Ok((list_bucket_result, response_data.status_code()))
     }
 
     /// List the contents of an S3 bucket, one [`ListBucketResult`] per page, following every
-    /// page of a truncated listing. Returns [`S3Error::InvalidListObjectsPagination`] if a
-    /// truncated page has no cursor to continue from, or repeats an earlier one.
+    /// page that is truncated or carries a cursor. Returns
+    /// [`S3Error::InvalidListObjectsPagination`] if a truncated page has no cursor to continue
+    /// from, or a page repeats an earlier cursor.
     ///
     /// # Example:
     ///
@@ -3360,7 +3406,7 @@ impl Bucket {
         let mut seen_cursors = HashSet::new();
 
         loop {
-            let (list_bucket_result, _) = self
+            let (page, _) = self
                 .list_page(
                     prefix.clone(),
                     delimiter.clone(),
@@ -3369,51 +3415,33 @@ impl Bucket {
                     None,
                 )
                 .await?;
+            let cursor = page
+                .next_continuation_token
+                .clone()
+                .filter(|cursor| !cursor.is_empty());
+            let is_truncated = page.is_truncated;
+            results.push(page);
 
-            if !list_bucket_result.is_truncated {
-                results.push(list_bucket_result);
-                break;
-            }
-
-            let cursor = self.next_list_cursor(&list_bucket_result).ok_or(
-                S3Error::InvalidListObjectsPagination(
-                    "truncated response has no continuation cursor",
-                ),
-            )?;
+            // A cursor means another page even if `IsTruncated` is false: some services leave
+            // the element out, and a missing one reads as false.
+            let cursor = match cursor {
+                Some(cursor) => cursor,
+                None if is_truncated => {
+                    return Err(S3Error::InvalidListObjectsPagination(
+                        "truncated response has no continuation cursor",
+                    ));
+                }
+                None => break,
+            };
             if !seen_cursors.insert(cursor.clone()) {
                 return Err(S3Error::InvalidListObjectsPagination(
                     "pagination cursor repeated",
                 ));
             }
-
             continuation_token = Some(cursor);
-            results.push(list_bucket_result);
         }
 
         Ok(results)
-    }
-
-    /// The `continuation_token` that continues the listing after `page`, a truncated page from
-    /// [`Self::list_page`], or `None` if the page has no cursor. ListObjects v1 services send
-    /// `NextMarker` only when the request had a delimiter; when it is absent, the listing
-    /// continues after the greatest key or common prefix on the page.
-    fn next_list_cursor(&self, page: &ListBucketResult) -> Option<String> {
-        let cursor = page
-            .next_continuation_token
-            .clone()
-            .filter(|cursor| !cursor.is_empty());
-        if self.listobjects_v2 {
-            return cursor;
-        }
-        cursor.or_else(|| {
-            let last_key = page.contents.last().map(|object| &object.key);
-            let last_prefix = page
-                .common_prefixes
-                .as_ref()
-                .and_then(|prefixes| prefixes.last())
-                .map(|prefix| &prefix.prefix);
-            last_key.max(last_prefix).cloned()
-        })
     }
 
     /// List one page of in-progress multipart uploads. Pass both returned cursor markers to

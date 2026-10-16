@@ -1,16 +1,19 @@
 // Model-output: Claude Opus 5.5
 
-//! `list` against the fake S3: the cursor each truncated page leads it to request next, in
-//! ListObjects v1 and v2, and the pages it refuses rather than return a partial listing.
+//! `list` against the fake S3: the cursor each page leads it to request next, in ListObjects
+//! v1 and v2, and the pages it refuses rather than return a partial listing.
 
 #![cfg(feature = "with-tokio")]
 
 mod fake_s3;
 
-use fake_s3::{BUCKET, Reply, bucket, http, reply, serve, within};
+use fake_s3::{BUCKET, bucket, http, query_of, reply, serve, within};
 use s3::error::S3Error;
 use s3::serde_types::ListBucketResult;
 use std::collections::HashMap;
+
+/// The element of a page whose keys, prefixes and `NextMarker` are URL-encoded.
+const URL_ENCODED: &str = "<EncodingType>url</EncodingType>";
 
 /// A `NextMarker` element, the cursor of a ListObjects v1 page.
 fn next_marker(marker: &str) -> String {
@@ -22,11 +25,12 @@ fn next_token(token: &str) -> String {
     format!("<NextContinuationToken>{token}</NextContinuationToken>")
 }
 
-/// A ListBucketResult reply listing `keys`, then `common_prefixes`. `cursor` is inserted
-/// verbatim: an element from `next_marker` or `next_token`, or "" for none.
-fn page(is_truncated: bool, cursor: &str, keys: &[&str], common_prefixes: &[&str]) -> Reply {
+/// The XML of a ListBucketResult page listing `keys`, then `common_prefixes`. `elements` is
+/// inserted verbatim after `IsTruncated`: `URL_ENCODED`, an element from `next_marker` or
+/// `next_token`, both, or "".
+fn page(is_truncated: bool, elements: &str, keys: &[&str], common_prefixes: &[&str]) -> String {
     let mut xml = format!(
-        "<ListBucketResult><Name>{BUCKET}</Name><IsTruncated>{is_truncated}</IsTruncated>{cursor}"
+        "<ListBucketResult><Name>{BUCKET}</Name><IsTruncated>{is_truncated}</IsTruncated>{elements}"
     );
     for key in keys {
         xml.push_str(&format!(
@@ -39,29 +43,28 @@ fn page(is_truncated: bool, cursor: &str, keys: &[&str], common_prefixes: &[&str
         ));
     }
     xml.push_str("</ListBucketResult>");
-    reply(http("200 OK", &[], xml.as_bytes()))
+    xml
 }
 
-/// The query parameters of the request whose head is `head`.
-fn query_of(head: &str) -> HashMap<String, String> {
-    let target = head.split_whitespace().nth(1).unwrap();
-    url::Url::parse(&format!("http://fake{target}"))
-        .unwrap()
-        .query_pairs()
-        .into_owned()
-        .collect()
+/// `page` without its `IsTruncated` element, as some services send it.
+fn without_is_truncated(page: String) -> String {
+    page.replace("<IsTruncated>false</IsTruncated>", "")
 }
 
 /// Lists the whole bucket with `Bucket::list`, through ListObjects v1 if `v1`, while the fake
 /// S3 serves `pages` in order. Returns the listing and the query of each request it made.
 async fn list(
     v1: bool,
-    pages: Vec<Reply>,
+    pages: Vec<String>,
 ) -> (
     Result<Vec<ListBucketResult>, S3Error>,
     Vec<HashMap<String, String>>,
 ) {
-    let (endpoint, server) = serve(pages).await;
+    let replies = pages
+        .iter()
+        .map(|page| reply(http("200 OK", &[], page.as_bytes())))
+        .collect();
+    let (endpoint, server) = serve(replies).await;
     let mut bucket = bucket(&endpoint);
     if v1 {
         bucket.set_listobjects_v1();
@@ -72,7 +75,8 @@ async fn list(
 }
 
 #[tokio::test]
-async fn list_continues_from_the_cursor_of_each_truncated_page() {
+async fn list_continues_from_the_cursor_of_each_page() {
+    let encoded_marker = format!("{URL_ENCODED}{}", next_marker("x%25+y"));
     let cases = [
         // v1 services send NextMarker only for a delimited listing; otherwise the last key
         // is the marker, or the last common prefix if it sorts after that key.
@@ -91,11 +95,43 @@ async fn list_continues_from_the_cursor_of_each_truncated_page() {
             "marker",
             "b/",
         ),
+        // A URL-encoded marker is decoded before it is compared and sent: "a b" < "a!".
+        (
+            true,
+            page(true, URL_ENCODED, &["a+b%2Fc"], &[]),
+            "marker",
+            "a b/c",
+        ),
+        (
+            true,
+            page(true, URL_ENCODED, &["a+b"], &["a!"]),
+            "marker",
+            "a!",
+        ),
+        (
+            true,
+            page(true, &encoded_marker, &["a"], &[]),
+            "marker",
+            "x% y",
+        ),
         (
             false,
             page(true, &next_token("t/1+"), &["a"], &[]),
             "continuation-token",
             "t/1+",
+        ),
+        // A cursor continues the listing on a page without IsTruncated.
+        (
+            true,
+            without_is_truncated(page(false, &next_marker("b"), &["a", "b"], &[])),
+            "marker",
+            "b",
+        ),
+        (
+            false,
+            without_is_truncated(page(false, &next_token("t"), &["a"], &[])),
+            "continuation-token",
+            "t",
         ),
     ];
 
@@ -103,22 +139,11 @@ async fn list_continues_from_the_cursor_of_each_truncated_page() {
         let (result, queries) = list(v1, vec![first_page, page(false, "", &["z"], &[])]).await;
         let pages = result.expect("two-page listing should succeed");
         assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].next_continuation_token.as_deref(), Some(cursor));
         assert_eq!(pages[1].contents[0].key, "z");
         assert_eq!(queries.len(), 2);
         assert!(!queries[0].contains_key(cursor_param));
         assert_eq!(queries[1][cursor_param], cursor);
-    }
-}
-
-/// Whether there is another page is up to `IsTruncated`, not to the presence of a cursor.
-#[tokio::test]
-async fn list_stops_at_an_untruncated_page_that_carries_a_cursor() {
-    let cases = [(true, next_marker("b")), (false, next_token("t"))];
-
-    for (v1, cursor) in cases {
-        let (result, queries) = list(v1, vec![page(false, &cursor, &["a", "b"], &[])]).await;
-        assert_eq!(result.expect("one-page listing should succeed").len(), 1);
-        assert_eq!(queries.len(), 1);
     }
 }
 
@@ -129,6 +154,11 @@ async fn list_rejects_truncated_pages_without_a_new_cursor() {
         (
             false,
             vec![page(true, "", &["a"], &[])],
+            "truncated response has no continuation cursor",
+        ),
+        (
+            false,
+            vec![page(true, &next_token(""), &["a"], &[])],
             "truncated response has no continuation cursor",
         ),
         (

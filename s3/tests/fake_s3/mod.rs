@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 //! A fake S3 that speaks minimal HTTP/1.1 on a local socket, for tests of public `Bucket`
 //! methods that need no object storage service: it serves scripted replies and hands back the
@@ -8,6 +9,7 @@
 
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +57,16 @@ pub fn header_of<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         let (field, value) = line.split_once(':')?;
         field.eq_ignore_ascii_case(name).then(|| value.trim())
     })
+}
+
+/// The query parameters of the request whose head is `head`, decoded.
+pub fn query_of(head: &str) -> HashMap<String, String> {
+    let target = head.split_whitespace().nth(1).unwrap();
+    url::Url::parse(&format!("http://fake{target}"))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
 }
 
 /// Reads one HTTP/1.1 request from `socket` and returns its head (request line and headers).

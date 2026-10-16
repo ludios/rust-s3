@@ -1,3 +1,5 @@
+// Model-output: Claude Opus 5.5
+
 #[derive(Deserialize, Debug)]
 pub struct InitiateMultipartUploadResponse {
     #[serde(rename = "Bucket")]
@@ -243,6 +245,9 @@ pub struct ListBucketResult {
     pub is_truncated: bool,
     #[serde(rename = "NextContinuationToken", default)] // for ListObjectsV2 request
     #[serde(alias = "NextMarker")] // for ListObjects request
+    /// Where the next page begins: the `continuation_token` to pass to
+    /// [`crate::bucket::Bucket::list_page`] for it. For ListObjects v1, `list_page` derives it
+    /// when a truncated page has no `NextMarker`, and URL-decodes it.
     pub next_continuation_token: Option<String>,
     #[serde(rename = "Contents", default)]
     /// Metadata about each object returned.
