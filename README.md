@@ -68,7 +68,7 @@ There are a lot of various features that enable a wide variety of use cases, ref
 
 All runtimes support either `native-tls` or `rustls-tls`, there are features for all combinations, refer to `s3/Cargo.toml` for a complete list.
 
-A download returns an object's stored bytes and reports its `Content-Encoding` as metadata: no client asks for a compressed transfer, and reqwest's decoders stay off even when another crate in the build enables `reqwest/gzip`. attohttpc's decoder cannot be switched off, so when another crate enables `attohttpc/compress`, the `sync` backend returns an error for an object stored with a gzip or deflate `Content-Encoding` rather than its decoded bytes; `cargo tree -e features -i attohttpc` names the crate.
+A download returns the bytes the server sends and reports their `Content-Encoding` as metadata. The `tokio` client never asks for a compressed transfer, and its decoders stay off even when another crate in the build enables `reqwest/gzip`, `brotli`, `zstd` or `deflate`. attohttpc's decoder cannot be switched off, and it asks servers to compress on its own: when another crate enables one of attohttpc's compression features (`compress` is in its defaults), the `sync` backend returns an error for an object download whose `Content-Encoding` is gzip or deflate, whether stored with the object or applied on the way, rather than its decoded bytes; `cargo tree -e features -i attohttpc` names the crate.
 
 To build with Tokio and rustls backed by ring, disable the default native-TLS feature:
 

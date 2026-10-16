@@ -45,9 +45,10 @@ fn session(request: &AttoRequest<'_>) -> Result<attohttpc::Session, S3Error> {
 }
 
 /// Whether this build's attohttpc decodes a response body whose `Content-Encoding` is gzip or
-/// deflate before handing it over. It does whenever any crate in the build enables its
-/// `compress` feature, and nothing can switch that off. The same feature makes a default
-/// request advertise `Accept-Encoding`, which is what this looks for: both hang off attohttpc's
+/// deflate before handing it over. It does whenever any crate in the build enables one of its
+/// compression features (`compress`, which is in its defaults, `compress-zlib` or
+/// `compress-zlib-ng`), and nothing can switch that off. The same features make a default
+/// request advertise `Accept-Encoding`, which is what this looks for: all hang off attohttpc's
 /// `flate2` dependency.
 fn attohttpc_decodes_bodies() -> bool {
     static DECODES: OnceLock<bool> = OnceLock::new();
@@ -59,11 +60,17 @@ fn attohttpc_decodes_bodies() -> bool {
     })
 }
 
-/// The `Content-Encoding` of `response` if attohttpc decoded its body on the way in, which
-/// per [`attohttpc_decodes_bodies`] it may do to a gzip or deflate one. The response to a
-/// HEAD has no body to decode.
+/// The `Content-Encoding` of `response` if it is a successful download of an object's bytes,
+/// a `GetObject` or `GetObjectRange`, that attohttpc decoded on the way in, which per
+/// [`attohttpc_decodes_bodies`] it does to a gzip or deflate one. Any other body is XML, or is
+/// discarded, and decoding it did no harm. attohttpc also decodes a gzip or deflate
+/// `Transfer-Encoding`, which it then strips from the headers; S3 never sends one.
 fn decoded_encoding(request: &AttoRequest<'_>, response: &attohttpc::Response) -> Option<String> {
-    if request.command.http_verb() == HttpMethod::Head || !attohttpc_decodes_bodies() {
+    let download = matches!(
+        request.command,
+        Command::GetObject | Command::GetObjectRange { .. }
+    );
+    if !download || !response.status().is_success() || !attohttpc_decodes_bodies() {
         return None;
     }
     let encodings: Vec<&str> = response
@@ -96,7 +103,7 @@ fn send(request: &AttoRequest<'_>) -> Result<attohttpc::Response, RequestAttempt
 }
 
 /// Sends `request` once and returns its response, or the failure its status reports under
-/// `fail-on-err`, or a refusal if attohttpc decoded its body: the stored bytes are gone.
+/// `fail-on-err`, or a refusal if attohttpc decoded an object's body: the stored bytes are gone.
 fn atto_response_attempt(
     request: &AttoRequest<'_>,
 ) -> Result<attohttpc::Response, RequestAttemptError> {

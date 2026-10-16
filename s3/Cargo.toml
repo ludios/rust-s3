@@ -61,7 +61,7 @@ md5 = "0.8"
 minidom = { version = "0.16", optional = true }
 percent-encoding = "2"
 quick-xml = { version = "0.41", features = ["serialize"] }
-reqwest = { version = "0.12", optional = true, features = [
+reqwest = { version = "0.12.4", optional = true, features = [
     "stream",
 ], default-features = false }
 serde = "1"

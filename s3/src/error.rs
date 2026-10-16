@@ -75,7 +75,7 @@ pub enum S3Error {
     AttoHeaderName(#[from] attohttpc::header::InvalidHeaderName),
     #[cfg(feature = "sync")]
     #[error(
-        "attohttpc decoded this body (Content-Encoding: {0}) before rust-s3 could return it as stored: a crate in this build enables attohttpc's `compress` feature, whose decoder cannot be switched off; `cargo tree -e features -i attohttpc` names the crate"
+        "attohttpc decoded this object's body (Content-Encoding: {0}) before rust-s3 could return it as sent: a crate in this build enables one of attohttpc's compression features (`compress`, in its defaults, `compress-zlib` or `compress-zlib-ng`), whose decoder cannot be switched off and which also asks servers to compress; `cargo tree -e features -i attohttpc` names the crate"
     )]
     AttoDecodedBody(String),
     #[error("Could not get Write lock on Credentials")]

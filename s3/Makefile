@@ -34,7 +34,7 @@
 	tokio-gzip-test-not-ignored sync-compress-test-not-ignored \
 	async-std-clippy-base async-std-clippy-native-tls async-std-clippy-rustls-tls
 
-# Full S3 CI: formatting, all ten library configurations, representative docs,
+# Full S3 CI: formatting, every library configuration, representative docs,
 # and clippy. Provider integration tests remain opt-in through test-ignored.
 ci: fmt-check clippy-all test-not-ignored
 
@@ -114,10 +114,10 @@ tokio-rustls-ring-clippy:
 tokio-rustls-ring-test-not-ignored:
 	cargo test --tests --examples --no-default-features --features tokio-rustls-tls-ring --features aws-creds/http-credentials
 
-# Any crate in a build can enable reqwest's `gzip` (likewise brotli, zstd, deflate); the
-# client must still return stored bytes.
+# Any crate in a build can enable reqwest's decoders; the client must still return the bytes
+# the server sent, and ask for no others.
 tokio-gzip-test-not-ignored:
-	cargo test --test content_encoding --features reqwest/gzip
+	cargo test --test content_encoding --features reqwest/gzip,reqwest/brotli,reqwest/zstd,reqwest/deflate
 
 # async-std library tests: base/no TLS, native TLS, and rustls.
 async-std-test-not-ignored: async-std-test-not-ignored-base async-std-test-not-ignored-native-tls async-std-test-not-ignored-rustls-tls async-std-fail-on-err-test
@@ -192,8 +192,8 @@ sync-nossl-test: sync-nossl-test-not-ignored
 sync-nossl-test-not-ignored:
 	cargo test --tests --examples --no-default-features --features sync --features aws-creds/http-credentials
 
-# Any crate in a build can enable attohttpc's `compress`, whose decoder cannot be switched
-# off; the backend must then refuse a decoded body rather than return it.
+# Any crate in a build can enable one of attohttpc's compression features, whose decoder
+# cannot be switched off; the backend must then refuse a decoded object rather than return it.
 sync-compress-test-not-ignored:
 	cargo test --test content_encoding --no-default-features --features sync,sync-native-tls,aws-creds/http-credentials,attohttpc/compress
 
