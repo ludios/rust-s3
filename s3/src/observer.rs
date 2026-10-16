@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::bucket::Bucket;
+use crate::error::S3Error;
 
 /// Sees every request the tokio backend hands to reqwest. Process-wide, set once.
 ///
@@ -28,8 +29,9 @@ pub trait RequestObserver: Send + Sync + 'static {
     /// `ReqwestRequest`s and so separate `op`s; the `uploadId` in the URL ties them.
     fn on_request(&self, op: u64, attempt: u32, bucket: &Bucket, request: &reqwest::Request);
 
-    /// Called when the response headers arrived, or when sending failed before that.
-    /// `elapsed` is measured around `Client::execute`, i.e. time to headers.
+    /// Called when the response headers arrived, or when the attempt failed before that:
+    /// sending failed, or the bucket's `request_timeout` passed. `elapsed` is measured
+    /// around `Client::execute`, i.e. time to headers.
     /// Return `Some` to have the backend tee the response body into it; the return value
     /// is ignored for `Err`.
     fn on_response(
@@ -37,7 +39,7 @@ pub trait RequestObserver: Send + Sync + 'static {
         op: u64,
         attempt: u32,
         elapsed: Duration,
-        result: Result<&reqwest::Response, &reqwest::Error>,
+        result: Result<&reqwest::Response, &S3Error>,
     ) -> Option<Box<dyn BodyObserver>>;
 }
 
@@ -58,9 +60,11 @@ pub trait BodyObserver: Send + 'static {
 pub enum BodyEnd<'a> {
     /// The body was read to its end.
     Eof,
-    /// reqwest returned an error mid-body. Its Display is often just "error decoding
-    /// response body"; the cause is in the `source()` chain.
-    Error(&'a reqwest::Error),
+    /// A read of the body failed: reqwest returned an error, whose Display is often just
+    /// "error decoding response body" with the cause in the `source()` chain, or the
+    /// bucket's `request_timeout` passed without a chunk, an `S3Error::Io` of kind
+    /// `TimedOut`.
+    Error(&'a S3Error),
     /// The stream was dropped before `Eof` or `Error` was seen. A consumer that stops after
     /// the last chunk without polling on to `None` lands here too, so this means "not known
     /// to be complete", not "bytes were missing".
@@ -91,7 +95,7 @@ static REQUEST_OBSERVER: OnceLock<Arc<dyn RequestObserver>> = OnceLock::new();
 ///         op: u64,
 ///         attempt: u32,
 ///         elapsed: Duration,
-///         result: Result<&s3::reqwest::Response, &s3::reqwest::Error>,
+///         result: Result<&s3::reqwest::Response, &s3::error::S3Error>,
 ///     ) -> Option<Box<dyn BodyObserver>> {
 ///         match result {
 ///             Ok(response) => eprintln!("op {op} attempt {attempt}: {} after {elapsed:?}", response.status()),

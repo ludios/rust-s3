@@ -87,7 +87,15 @@ default = ["fail-on-err", "tags", "tokio-native-tls", "http-credentials-native-t
 sync = ["attohttpc", "maybe-async/is_sync"]
 with-async-std-hyper = ["with-async-std", "surf/hyper-client"]
 with-async-std = ["async-std", "futures-util", "surf", "sysinfo"]
-with-tokio = ["futures-util", "reqwest", "tokio", "tokio/fs", "tokio-stream", "sysinfo"]
+with-tokio = [
+    "futures-util",
+    "reqwest",
+    "tokio",
+    "tokio/fs",
+    "tokio/time",
+    "tokio-stream",
+    "sysinfo",
+]
 
 blocking = ["block_on_proc", "tokio/rt", "tokio/rt-multi-thread"]
 fail-on-err = []

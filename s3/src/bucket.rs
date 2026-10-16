@@ -20,7 +20,7 @@
 //! ## Constants
 //!
 //! - `CHUNK_SIZE`: Defines the chunk size for multipart uploads (8 MiB).
-//! - `DEFAULT_REQUEST_TIMEOUT`: The default request timeout (60 seconds).
+//! - `DEFAULT_REQUEST_TIMEOUT`: The default `request_timeout` (60 seconds of inactivity).
 //!
 //! ## Types
 //!
@@ -1039,6 +1039,7 @@ impl Bucket {
         })
     }
 
+    /// A copy of this bucket with `request_timeout` set; see [`Bucket::set_request_timeout`].
     #[cfg(not(feature = "with-tokio"))]
     pub fn with_request_timeout(&self, request_timeout: Duration) -> Result<Box<Bucket>, S3Error> {
         Ok(Box::new(Bucket {
@@ -1055,6 +1056,7 @@ impl Bucket {
         }))
     }
 
+    /// A copy of this bucket with `request_timeout` set; see [`Bucket::set_request_timeout`].
     #[cfg(feature = "with-tokio")]
     pub fn with_request_timeout(&self, request_timeout: Duration) -> Result<Box<Bucket>, S3Error> {
         Ok(Box::new(Bucket {
@@ -3558,13 +3560,19 @@ impl Bucket {
         self.path_style = false;
     }
 
-    /// Configure the total per-attempt timeout for HTTP requests, or disable
-    /// the library-level deadline with `None`. Defaults to 60 seconds.
+    /// Configure how long a request may wait on the server without progress, or `None`
+    /// for no limit. Defaults to 60 seconds.
     ///
-    /// Async backends apply this deadline from HTTP send through response-body
-    /// reads used by buffered downloads, writer copies, and lazy streams.
-    /// The synchronous backend uses its transport's timeout behavior; disabling
-    /// the library-level deadline does not remove transport-specific limits.
+    /// The limit applies, per attempt, to the wait for the response headers after the
+    /// request is handed to the HTTP client, connecting and sending the request body
+    /// included, and then to each wait for the next chunk of the response body. A transfer
+    /// that keeps moving never times out, however large the object; a single `put_object`
+    /// must still upload its whole body within the limit, which `put_object_stream` avoids
+    /// by sending parts. A timeout surfaces as `S3Error::Io` of kind `TimedOut`; one while
+    /// waiting for the headers is retried like other transient failures.
+    ///
+    /// The synchronous backend maps the limit onto its transport's connect and read
+    /// timeouts, which keep that transport's own 30-second defaults under `None`.
     pub fn set_request_timeout(&mut self, timeout: Option<Duration>) {
         self.request_timeout = timeout;
     }

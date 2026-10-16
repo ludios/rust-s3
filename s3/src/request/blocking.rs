@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 extern crate base64;
 extern crate md5;
 
@@ -26,20 +28,25 @@ pub struct AttoRequest<'a> {
     pub sync: bool,
 }
 
+/// A session carrying `request`'s signed headers, with the bucket's `request_timeout` as its
+/// connect and read timeouts, so that a transfer that keeps moving never times out, however
+/// large. Without one, attohttpc's own 30-second defaults for both stay.
+fn session(request: &AttoRequest<'_>) -> Result<attohttpc::Session, S3Error> {
+    let mut session = attohttpc::Session::new();
+    for (name, value) in request.headers()?.iter() {
+        session.header(HeaderName::from_bytes(name.as_ref())?, value.to_str()?);
+    }
+    if let Some(limit) = request.bucket.request_timeout {
+        session.connect_timeout(limit);
+        session.read_timeout(limit);
+    }
+    Ok(session)
+}
+
 fn atto_response_attempt(
     request: &AttoRequest<'_>,
 ) -> Result<attohttpc::Response, crate::request::RequestAttemptError> {
-    let headers = request.headers()?;
-    let mut session = attohttpc::Session::new();
-    for (name, value) in headers.iter() {
-        session.header(
-            HeaderName::from_bytes(name.as_ref()).map_err(S3Error::from)?,
-            value.to_str().map_err(S3Error::from)?,
-        );
-    }
-    if let Some(timeout) = request.bucket.request_timeout {
-        session.timeout(timeout)
-    }
+    let session = session(request)?;
     let builder = match request.command.http_verb() {
         HttpMethod::Get => session.get(request.url()?),
         HttpMethod::Delete => session.delete(request.url()?),
@@ -84,20 +91,7 @@ impl<'a> Request for AttoRequest<'a> {
 
     fn response_status(&self) -> Result<u16, S3Error> {
         crate::request::retry_request_sync(&self.command, || {
-            let headers = self.headers()?;
-            let mut session = attohttpc::Session::new();
-
-            for (name, value) in headers.iter() {
-                session.header(
-                    HeaderName::from_bytes(name.as_ref()).map_err(S3Error::from)?,
-                    value.to_str().map_err(S3Error::from)?,
-                );
-            }
-
-            if let Some(timeout) = self.bucket.request_timeout {
-                session.timeout(timeout)
-            }
-
+            let session = session(self)?;
             let request = match self.command.http_verb() {
                 HttpMethod::Get => session.get(self.url()?),
                 HttpMethod::Delete => session.delete(self.url()?),
@@ -209,10 +203,15 @@ impl<'a> AttoRequest<'a> {
 mod tests {
     use crate::bucket::Bucket;
     use crate::command::Command;
+    use crate::error::S3Error;
     use crate::request::Request;
     use crate::request::blocking::AttoRequest;
     use anyhow::Result;
     use awscreds::Credentials;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
     // Fake keys - otherwise using Credentials::default will use actual user
     // credentials if they exist.
@@ -220,6 +219,86 @@ mod tests {
         let access_key = "AKIAIOSFODNN7EXAMPLE";
         let secert_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
         Credentials::new(Some(access_key), Some(secert_key), None, None, None).unwrap()
+    }
+
+    /// Serves one request on a local socket, answering with `script`: each step sleeps for
+    /// its delay, then writes its bytes. Returns the endpoint.
+    fn serve_script(script: Vec<(Duration, &'static [u8])>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            for (delay, bytes) in script {
+                thread::sleep(delay);
+                if stream.write_all(bytes).is_err() {
+                    return;
+                }
+            }
+        });
+        endpoint
+    }
+
+    fn timeout_bucket(endpoint: String, limit: Duration) -> Bucket {
+        let region = crate::region::Region::Custom {
+            region: "us-east-1".to_owned(),
+            endpoint,
+        };
+        let mut bucket = *Bucket::new("timeout-test", region, fake_credentials())
+            .unwrap()
+            .with_path_style();
+        bucket.set_request_timeout(Some(limit));
+        bucket
+    }
+
+    #[test]
+    fn request_timeout_resets_with_each_body_chunk() {
+        // Three gaps add up to more than the limit; each alone is within it.
+        let gap = Duration::from_millis(400);
+        let endpoint = serve_script(vec![
+            (
+                Duration::ZERO,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n",
+            ),
+            (gap, b"ab"),
+            (gap, b"cd"),
+            (gap, b"ef"),
+        ]);
+        let bucket = timeout_bucket(endpoint, Duration::from_secs(1));
+
+        let response = bucket
+            .get_object("/object")
+            .expect("a body that keeps arriving must not time out");
+        assert_eq!(response.as_slice(), b"abcdef");
+    }
+
+    #[test]
+    fn request_timeout_fails_a_stalled_body() {
+        let endpoint = serve_script(vec![
+            (
+                Duration::ZERO,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc",
+            ),
+            (Duration::from_secs(3), b"def"),
+        ]);
+        let bucket = timeout_bucket(endpoint, Duration::from_millis(300));
+
+        let error = bucket
+            .get_object("/object")
+            .expect_err("a stalled body must time out");
+        assert!(
+            matches!(&error, S3Error::Atto(error)
+                if matches!(error.kind(), attohttpc::ErrorKind::Io(io)
+                    if matches!(io.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))),
+            "{error:?}"
+        );
     }
 
     #[test]

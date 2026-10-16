@@ -88,7 +88,7 @@ impl RequestObserver for Recorder {
         op: u64,
         attempt: u32,
         _elapsed: Duration,
-        result: Result<&s3::reqwest::Response, &s3::reqwest::Error>,
+        result: Result<&s3::reqwest::Response, &s3::error::S3Error>,
     ) -> Option<Box<dyn BodyObserver>> {
         match result {
             Ok(response) => record(Event::Response {

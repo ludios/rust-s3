@@ -9,7 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::OnceLock;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::bucket::Bucket;
 use crate::command::Command;
@@ -18,7 +18,7 @@ use crate::utils::now_utc;
 use time::OffsetDateTime;
 
 use crate::command::HttpMethod;
-use crate::request::{Request, ResponseData, ResponseDataStream};
+use crate::request::{Request, ResponseData, ResponseDataStream, timeout_error};
 
 use http::HeaderMap;
 use maybe_async::maybe_async;
@@ -53,132 +53,77 @@ fn surf_client() -> Result<&'static surf::Client, S3Error> {
         .map_err(|error| S3Error::Surf(error.clone()))
 }
 
-#[derive(Clone, Copy)]
-struct RequestDeadline {
-    expires_at: Instant,
-}
-
-impl RequestDeadline {
-    fn new(timeout: Duration) -> Option<Self> {
-        Instant::now()
-            .checked_add(timeout)
-            .map(|expires_at| Self { expires_at })
-    }
-
-    fn remaining(self) -> Option<Duration> {
-        self.expires_at
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-    }
-}
-
-struct DeadlineReader {
+/// A response body whose reads are bounded by the bucket's `request_timeout`: a read that
+/// finds no data arms a timer, the next data disarms it, and a read still waiting when it
+/// fires fails with `TimedOut`. A body that keeps arriving never times out, however long.
+struct IdleReader {
     body: surf::http::Body,
-    deadline: RequestDeadline,
+    limit: Duration,
     timer: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
-    ended: bool,
 }
 
-impl DeadlineReader {
-    fn new(body: surf::http::Body, deadline: RequestDeadline) -> Self {
-        Self {
-            body,
-            deadline,
-            timer: None,
-            ended: false,
-        }
-    }
-}
-
-impl async_std::io::Read for DeadlineReader {
+impl async_std::io::Read for IdleReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
         buffer: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        if buffer.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
         let this = self.as_mut().get_mut();
-        if this.ended {
-            return Poll::Ready(Ok(0));
+        // The body is polled first, so data that is ready goes out even if the timer lapsed
+        // while nobody was reading.
+        if let Poll::Ready(result) = Pin::new(&mut this.body).poll_read(context, buffer) {
+            this.timer = None;
+            return Poll::Ready(result);
         }
-        let Some(remaining) = this.deadline.remaining() else {
-            return Poll::Ready(Err(request_timeout_error()));
-        };
-
-        if this.timer.is_none() {
-            this.timer = Some(Box::pin(async_std::task::sleep(remaining)));
-        }
-        if this
+        let limit = this.limit;
+        let timer = this
             .timer
-            .as_mut()
-            .expect("deadline timer was initialized")
-            .as_mut()
-            .poll(context)
-            .is_ready()
-        {
-            return Poll::Ready(Err(request_timeout_error()));
-        }
-
-        match Pin::new(&mut this.body).poll_read(context, buffer) {
-            Poll::Ready(Ok(0)) => {
-                this.ended = true;
-                Poll::Ready(Ok(0))
-            }
-            result => result,
+            .get_or_insert_with(|| Box::pin(async_std::task::sleep(limit)));
+        match timer.as_mut().poll(context) {
+            Poll::Ready(()) => Poll::Ready(Err(timeout_error("response body data", limit))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-fn request_timeout_error() -> io::Error {
-    io::Error::new(io::ErrorKind::TimedOut, "S3 request timed out")
-}
-
-fn timeout_attempt_error() -> crate::request::RequestAttemptError {
-    crate::request::RequestAttemptError::surf_send_error(surf::Error::new(
-        surf::http::StatusCode::GatewayTimeout,
-        request_timeout_error(),
-    ))
-}
-
-async fn send_with_deadline(
+/// Sends `request`, failing if the response headers take longer than `limit`, and bounds each
+/// wait for a chunk of the body by `limit` too. `None` waits forever.
+async fn send_with_timeout(
     request: surf::RequestBuilder,
-    timeout: Option<Duration>,
+    limit: Option<Duration>,
 ) -> Result<surf::Response, crate::request::RequestAttemptError> {
-    // Start immediately before sending so request building and signing do not
-    // consume the network deadline. Very large durations that cannot be
-    // represented by `Instant` are effectively unbounded.
-    let deadline = timeout.and_then(RequestDeadline::new);
     let send = surf_client()
         .map_err(crate::request::RequestAttemptError::from)?
         .send(request.build());
-    let response = match deadline {
-        Some(deadline) => {
-            let remaining = deadline.remaining().ok_or_else(timeout_attempt_error)?;
-            async_std::future::timeout(remaining, send)
-                .await
-                .map_err(|_| timeout_attempt_error())?
-                .map_err(crate::request::RequestAttemptError::surf_send_error)?
-        }
+    let response = match limit {
+        Some(limit) => async_std::future::timeout(limit, send)
+            .await
+            .map_err(|_| {
+                crate::request::RequestAttemptError::transient(S3Error::Io(timeout_error(
+                    "response headers",
+                    limit,
+                )))
+            })?
+            .map_err(crate::request::RequestAttemptError::surf_send_error)?,
         None => send
             .await
             .map_err(crate::request::RequestAttemptError::surf_send_error)?,
     };
-
-    Ok(apply_body_deadline(response, deadline))
+    Ok(apply_body_timeout(response, limit))
 }
 
-fn apply_body_deadline(
-    mut response: surf::Response,
-    deadline: Option<RequestDeadline>,
-) -> surf::Response {
-    if let Some(deadline) = deadline {
+/// Rewraps the body of `response` in an `IdleReader`, keeping its length and MIME type, so
+/// that every way of reading it is bounded, the raw `surf::Response` included.
+fn apply_body_timeout(mut response: surf::Response, limit: Option<Duration>) -> surf::Response {
+    if let Some(limit) = limit {
         let length = response.len();
         let body = response.take_body();
         let mime = body.mime().clone();
-        let reader = DeadlineReader::new(body, deadline);
+        let reader = IdleReader {
+            body,
+            limit,
+            timer: None,
+        };
         let mut wrapped =
             surf::http::Body::from_reader(async_std::io::BufReader::new(reader), length);
         wrapped.set_mime(mime);
@@ -207,7 +152,7 @@ async fn surf_response_attempt(
                 .expect("Could not parse header value"),
         );
     }
-    let mut response = send_with_deadline(request_builder, request.bucket.request_timeout).await?;
+    let mut response = send_with_timeout(request_builder, request.bucket.request_timeout).await?;
     if cfg!(feature = "fail-on-err") && !response.status().is_success() {
         let status = u16::from(response.status());
         let body = response.body_string().await.map_err(|error| {
@@ -284,7 +229,7 @@ impl<'a> Request for SurfRequest<'a> {
                 );
             }
 
-            let mut response = send_with_deadline(request, self.bucket.request_timeout).await?;
+            let mut response = send_with_timeout(request, self.bucket.request_timeout).await?;
             let status = u16::from(response.status());
 
             if status == 404 {
@@ -436,6 +381,8 @@ mod tests {
         BeforeHeaders,
         AfterHeaders,
         AfterPrefix(usize),
+        /// No pause: the body goes out one byte at a time with this gap before each.
+        Trickle(std::time::Duration),
     }
 
     struct PausedServer {
@@ -520,12 +467,10 @@ mod tests {
                     .map_err(|error| format!("release before headers: {error}"))?;
             }
 
-            let initial_body = if matches!(pause_at, PauseAt::AfterPrefix(_)) {
-                &body[..prefix_len]
-            } else if matches!(pause_at, PauseAt::AfterHeaders) {
-                &body[..0]
-            } else {
-                &body[..]
+            let initial_body = match pause_at {
+                PauseAt::AfterPrefix(_) => &body[..prefix_len],
+                PauseAt::AfterHeaders | PauseAt::Trickle(_) => &body[..0],
+                PauseAt::BeforeHeaders => &body[..],
             };
             let initial_write = async {
                 connection.write_all(response_header.as_bytes()).await?;
@@ -535,6 +480,15 @@ mod tests {
             // before this delayed write; that disconnect is expected.
             let _ =
                 async_std::future::timeout(std::time::Duration::from_secs(2), initial_write).await;
+            if let PauseAt::Trickle(gap) = pause_at {
+                for byte in &body {
+                    async_std::task::sleep(gap).await;
+                    connection
+                        .write_all(std::slice::from_ref(byte))
+                        .await
+                        .map_err(|error| format!("trickle write: {error}"))?;
+                }
+            }
             if matches!(pause_at, PauseAt::AfterHeaders | PauseAt::AfterPrefix(_)) {
                 async_std::future::timeout(std::time::Duration::from_secs(4), release_rx.recv())
                     .await
@@ -638,7 +592,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn request_timeout_deadline_covers_public_response_body_reads() {
+    async fn request_timeout_covers_public_response_body_reads() {
         let server = start_paused_server(200, b"abcdef".to_vec(), PauseAt::AfterPrefix(3)).await;
         let bucket = timeout_bucket(
             server.endpoint.clone(),
@@ -662,22 +616,47 @@ mod tests {
         .unwrap();
         assert!(request_line.starts_with("PUT "));
 
-        async_std::task::sleep(std::time::Duration::from_millis(500)).await;
-        let body_result = async_std::future::timeout(
-            std::time::Duration::from_millis(200),
-            response.body_bytes(),
-        )
-        .await
-        .expect("body timeout should be shorter than the outer bound");
+        let body_result =
+            async_std::future::timeout(std::time::Duration::from_secs(2), response.body_bytes())
+                .await
+                .expect("body timeout should be shorter than the outer bound");
         assert!(
             body_result.is_err(),
-            "raw Surf response body must keep its deadline"
+            "raw Surf response body must keep its idle timeout"
         );
         server.finish().await.unwrap();
     }
 
     #[async_std::test]
-    async fn request_timeout_deadline_covers_delayed_response_headers() {
+    async fn request_timeout_resets_with_each_body_chunk() {
+        // Three gaps add up to more than the limit; each alone is within it.
+        let server = start_paused_server(
+            200,
+            b"abc".to_vec(),
+            PauseAt::Trickle(std::time::Duration::from_millis(500)),
+        )
+        .await;
+        let bucket = timeout_bucket(
+            server.endpoint.clone(),
+            Some(std::time::Duration::from_secs(1)),
+        );
+        let request = SurfRequest::new(&bucket, "/object", Command::GetObject)
+            .await
+            .unwrap();
+
+        let response = async_std::future::timeout(
+            std::time::Duration::from_secs(5),
+            request.response_data(false),
+        )
+        .await
+        .expect("download should finish within the fixture bound")
+        .expect("a body that keeps arriving must not time out");
+        assert_eq!(response.as_slice(), b"abc");
+        server.finish().await.unwrap();
+    }
+
+    #[async_std::test]
+    async fn request_timeout_covers_delayed_response_headers() {
         let server = start_paused_server(200, b"ok".to_vec(), PauseAt::BeforeHeaders).await;
         let mut bucket = timeout_bucket(server.endpoint.clone(), None);
         bucket.set_request_timeout(Some(std::time::Duration::from_millis(300)));
@@ -692,12 +671,16 @@ mod tests {
         .await
         .expect("header timeout should be shorter than outer bound");
         assert!(request_line.unwrap().starts_with("PUT "));
-        assert!(matches!(result, Err(crate::error::S3Error::Surf(_))));
+        assert!(matches!(
+            result,
+            Err(crate::error::S3Error::Io(error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
         server.finish().await.unwrap();
     }
 
     #[async_std::test]
-    async fn request_timeout_deadline_preserves_exact_writer_prefix() {
+    async fn request_timeout_preserves_exact_writer_prefix() {
         let server = start_paused_server(200, b"abcdef".to_vec(), PauseAt::AfterPrefix(3)).await;
         let bucket = timeout_bucket(
             server.endpoint.clone(),
@@ -732,7 +715,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn request_timeout_deadline_applies_to_lazy_stream_reads() {
+    async fn request_timeout_applies_to_lazy_stream_reads() {
         use futures_util::StreamExt;
 
         let server = start_paused_server(200, b"abcdef".to_vec(), PauseAt::AfterPrefix(3)).await;
@@ -778,7 +761,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn request_timeout_deadline_covers_status_error_body() {
+    async fn request_timeout_covers_status_error_body() {
         let server =
             start_paused_server(403, b"access denied".to_vec(), PauseAt::AfterHeaders).await;
         let bucket = timeout_bucket(
@@ -812,7 +795,7 @@ mod tests {
     }
 
     #[async_std::test]
-    async fn request_timeout_none_removes_deadline() {
+    async fn request_timeout_none_removes_limit() {
         use futures_util::future::{Either, select};
 
         let server = start_paused_server(200, b"ok".to_vec(), PauseAt::BeforeHeaders).await;

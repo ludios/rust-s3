@@ -5,15 +5,17 @@ extern crate base64;
 extern crate md5;
 
 use bytes::Bytes;
-use futures_util::{Stream, TryStreamExt};
+use futures_util::Stream;
 use maybe_async::maybe_async;
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use tokio::time::Sleep;
 
 use super::request_trait::{Request, ResponseData, ResponseDataStream};
 use crate::bucket::Bucket;
@@ -21,7 +23,7 @@ use crate::command::Command;
 use crate::command::HttpMethod;
 use crate::error::S3Error;
 use crate::observer::{BodyEnd, BodyObserver, request_observer};
-use crate::request::RequestAttemptError;
+use crate::request::{RequestAttemptError, timeout_error};
 use crate::utils::now_utc;
 
 use tokio_stream::StreamExt;
@@ -96,33 +98,63 @@ pub struct ReqwestRequest<'a> {
     attempts: AtomicU32,
 }
 
-/// A response whose headers have arrived, with the observer that is to see its body.
-type ObservedResponse = (reqwest::Response, Option<Box<dyn BodyObserver>>);
+/// A response whose headers have arrived, with the observer that is to see its body and the
+/// bucket's `request_timeout`, which bounds each wait for a chunk of that body.
+struct ObservedResponse {
+    response: reqwest::Response,
+    observer: Option<Box<dyn BodyObserver>>,
+    idle_limit: Option<Duration>,
+}
 
-/// The body stream of one response, teed into its `BodyObserver`. Every body the backend reads
-/// goes through this, whether or not an observer is set, so there is one code path.
+impl ObservedResponse {
+    fn body(self) -> ObservedBody {
+        ObservedBody {
+            stream: Box::pin(self.response.bytes_stream()),
+            observer: self.observer,
+            idle_limit: self.idle_limit,
+            idle_timer: None,
+        }
+    }
+}
+
+/// The body stream of one response, teed into its `BodyObserver` and bounded by the bucket's
+/// `request_timeout`. Every body the backend reads goes through this, whether or not an
+/// observer is set, so there is one code path.
 ///
 /// The observer is taken out of its `Option` before `end` is called, which is what makes `end`
 /// run at most once, `Drop` included.
 struct ObservedBody {
     stream: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     observer: Option<Box<dyn BodyObserver>>,
-}
-
-impl ObservedBody {
-    fn new(response: reqwest::Response, observer: Option<Box<dyn BodyObserver>>) -> Self {
-        Self {
-            stream: Box::pin(response.bytes_stream()),
-            observer,
-        }
-    }
+    /// How long one wait for the next chunk may last, if bounded at all.
+    idle_limit: Option<Duration>,
+    /// Runs while a chunk is awaited: armed by a poll that found none, dropped by the next
+    /// chunk. A body that keeps arriving never times out, however long it is.
+    idle_timer: Option<Pin<Box<Sleep>>>,
 }
 
 impl Stream for ObservedBody {
-    type Item = reqwest::Result<Bytes>;
+    type Item = Result<Bytes, S3Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let item = ready!(self.stream.as_mut().poll_next(cx));
+        // The stream is polled first, so a chunk that is ready goes out even if the timer
+        // lapsed while the consumer was busy with something else.
+        let item = match self.stream.as_mut().poll_next(cx) {
+            Poll::Ready(item) => {
+                self.idle_timer = None;
+                item.map(|chunk| chunk.map_err(S3Error::Reqwest))
+            }
+            Poll::Pending => {
+                let Some(limit) = self.idle_limit else {
+                    return Poll::Pending;
+                };
+                let timer = self
+                    .idle_timer
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+                ready!(timer.as_mut().poll(cx));
+                Some(Err(S3Error::Io(timeout_error("response body data", limit))))
+            }
+        };
         match &item {
             Some(Ok(bytes)) => {
                 if let Some(observer) = &mut self.observer {
@@ -171,12 +203,9 @@ async fn collect(mut body: ObservedBody) -> Result<Bytes, S3Error> {
 /// The error `fail-on-err` reports for a non-2xx response: its status and its body, decoded
 /// as UTF-8 lossily whatever its charset, retryable or not by status. A body that cannot be
 /// read yields that read's error instead, which is never retried.
-async fn http_fail_with_body(
-    response: reqwest::Response,
-    observer: Option<Box<dyn BodyObserver>>,
-) -> RequestAttemptError {
-    let status = response.status().as_u16();
-    match collect(ObservedBody::new(response, observer)).await {
+async fn http_fail_with_body(observed: ObservedResponse) -> RequestAttemptError {
+    let status = observed.response.status().as_u16();
+    match collect(observed.body()).await {
         Ok(body) => {
             S3Error::HttpFailWithBody(status, String::from_utf8_lossy(&body).into_owned()).into()
         }
@@ -185,7 +214,8 @@ async fn http_fail_with_body(
 }
 
 /// Builds the signed request and sends it once, without retrying or looking at the status.
-/// Returns as soon as the response headers have arrived; the body is unread.
+/// Returns as soon as the response headers have arrived, or fails once the bucket's
+/// `request_timeout` has passed without them; the body is unread.
 /// The installed `RequestObserver`, if any, sees the attempt and may attach a body
 /// observer to the response.
 async fn execute(request: &ReqwestRequest<'_>) -> Result<ObservedResponse, RequestAttemptError> {
@@ -212,16 +242,11 @@ async fn execute(request: &ReqwestRequest<'_>) -> Result<ObservedResponse, Reque
         HttpMethod::Head => reqwest::Method::HEAD,
     };
 
-    let request_builder = client
+    let built = client
         .request(method, request.url()?.as_str())
         .headers(headers)
-        .body(request.request_body()?);
-    let request_builder = if let Some(timeout) = request.bucket.request_timeout {
-        request_builder.timeout(timeout)
-    } else {
-        request_builder
-    };
-    let built = request_builder.build()?;
+        .body(request.request_body()?)
+        .build()?;
 
     // A request that failed to build above consumed no attempt number. The observer is
     // read once so that both callbacks of an attempt go to the same one.
@@ -231,11 +256,33 @@ async fn execute(request: &ReqwestRequest<'_>) -> Result<ObservedResponse, Reque
         observer.on_request(request.op, attempt, request.bucket, &built);
     }
     let started = Instant::now();
-    let result = client.execute(built).await;
+    let idle_limit = request.bucket.request_timeout;
+    let result = match idle_limit {
+        None => client
+            .execute(built)
+            .await
+            .map_err(RequestAttemptError::from),
+        Some(limit) => match tokio::time::timeout(limit, client.execute(built)).await {
+            Ok(result) => result.map_err(RequestAttemptError::from),
+            Err(_) => Err(RequestAttemptError::transient(S3Error::Io(timeout_error(
+                "response headers",
+                limit,
+            )))),
+        },
+    };
     let body_observer = observer.and_then(|observer| {
-        observer.on_response(request.op, attempt, started.elapsed(), result.as_ref())
+        observer.on_response(
+            request.op,
+            attempt,
+            started.elapsed(),
+            result.as_ref().map_err(|error| &error.error),
+        )
     });
-    Ok((result?, body_observer))
+    Ok(ObservedResponse {
+        response: result?,
+        observer: body_observer,
+        idle_limit,
+    })
 }
 
 /// `execute` plus the `fail-on-err` policy: a non-2xx response becomes an error carrying
@@ -243,13 +290,13 @@ async fn execute(request: &ReqwestRequest<'_>) -> Result<ObservedResponse, Reque
 async fn request_response_attempt(
     request: &ReqwestRequest<'_>,
 ) -> Result<ObservedResponse, RequestAttemptError> {
-    let (response, observer) = execute(request).await?;
+    let observed = execute(request).await?;
 
-    if cfg!(feature = "fail-on-err") && !response.status().is_success() {
-        return Err(http_fail_with_body(response, observer).await);
+    if cfg!(feature = "fail-on-err") && !observed.response.status().is_success() {
+        return Err(http_fail_with_body(observed).await);
     }
 
-    Ok((response, observer))
+    Ok(observed)
 }
 
 #[maybe_async]
@@ -257,25 +304,26 @@ impl<'a> Request for ReqwestRequest<'a> {
     type Response = reqwest::Response;
     type HeaderMap = reqwest::header::HeaderMap;
 
-    /// The raw response. Whatever the caller reads of its body goes unobserved.
+    /// The raw response. Whatever the caller reads of its body goes unobserved and is not
+    /// bounded by the bucket's `request_timeout`.
     async fn response(&self) -> Result<Self::Response, S3Error> {
         request_response_attempt(self)
             .await
-            .map(|(response, _)| response)
+            .map(|observed| observed.response)
             .map_err(|error| error.error)
     }
 
     async fn response_status(&self) -> Result<u16, S3Error> {
         crate::request::retry_request(&self.command, || async {
-            let (response, observer) = execute(self).await?;
-            let status = response.status().as_u16();
+            let observed = execute(self).await?;
+            let status = observed.response.status().as_u16();
 
             if status == 404 {
                 return Ok(status);
             }
 
-            if cfg!(feature = "fail-on-err") && !response.status().is_success() {
-                return Err(http_fail_with_body(response, observer).await);
+            if cfg!(feature = "fail-on-err") && !observed.response.status().is_success() {
+                return Err(http_fail_with_body(observed).await);
             }
 
             Ok(status)
@@ -284,10 +332,10 @@ impl<'a> Request for ReqwestRequest<'a> {
     }
 
     async fn response_data(&self, etag: bool) -> Result<ResponseData, S3Error> {
-        let (response, observer) =
+        let observed =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
-        let status_code = response.status().as_u16();
-        let mut headers = response.headers().clone();
+        let status_code = observed.response.status().as_u16();
+        let mut headers = observed.response.headers().clone();
         let response_headers = headers
             .clone()
             .iter()
@@ -319,7 +367,7 @@ impl<'a> Request for ReqwestRequest<'a> {
                 Bytes::from("")
             }
         } else {
-            collect(ObservedBody::new(response, observer)).await?
+            collect(observed.body()).await?
         };
         Ok(ResponseData::new(body_vec, status_code, response_headers))
     }
@@ -329,11 +377,11 @@ impl<'a> Request for ReqwestRequest<'a> {
         writer: &mut T,
     ) -> Result<u16, S3Error> {
         use tokio::io::AsyncWriteExt;
-        let (response, observer) =
+        let observed =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
 
-        let status_code = response.status();
-        let mut stream = ObservedBody::new(response, observer);
+        let status_code = observed.response.status();
+        let mut stream = observed.body();
 
         while let Some(item) = stream.next().await {
             writer.write_all(&item?).await?;
@@ -343,24 +391,23 @@ impl<'a> Request for ReqwestRequest<'a> {
     }
 
     async fn response_data_to_stream(&self) -> Result<ResponseDataStream, S3Error> {
-        let (response, observer) =
+        let observed =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
-        let status_code = response.status().as_u16();
-        let headers = response.headers().clone();
-        let stream = ObservedBody::new(response, observer).map_err(S3Error::Reqwest);
+        let status_code = observed.response.status().as_u16();
+        let headers = observed.response.headers().clone();
 
         Ok(ResponseDataStream {
-            bytes: Box::pin(stream),
+            bytes: Box::pin(observed.body()),
             status_code,
             headers,
         })
     }
 
     async fn response_header(&self) -> Result<(Self::HeaderMap, u16), S3Error> {
-        let (response, _) =
+        let observed =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
-        let status_code = response.status().as_u16();
-        let headers = response.headers().clone();
+        let status_code = observed.response.status().as_u16();
+        let headers = observed.response.headers().clone();
         Ok((headers, status_code))
     }
 
@@ -442,7 +489,7 @@ mod tests {
         response: &'static [u8],
         delay: Duration,
     ) -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {
-        mock_http_response(response, None, delay)
+        mock_http_response(vec![(delay, response)])
     }
 
     fn stalled_http_body(
@@ -450,13 +497,16 @@ mod tests {
         trailing_body: &'static [u8],
         delay: Duration,
     ) -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {
-        mock_http_response(initial_response, Some(trailing_body), delay)
+        mock_http_response(vec![
+            (Duration::ZERO, initial_response),
+            (delay, trailing_body),
+        ])
     }
 
+    /// Serves one request, answering with `script`: each step waits out its delay, which a
+    /// message on the returned channel cuts short to end the server, then writes its bytes.
     fn mock_http_response(
-        initial_response: &'static [u8],
-        trailing_body: Option<&'static [u8]>,
-        delay: Duration,
+        script: Vec<(Duration, &'static [u8])>,
     ) -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -498,25 +548,16 @@ mod tests {
                     "request header exceeded fixture bound"
                 );
             }
-            if trailing_body.is_none()
-                && !matches!(
-                    stop_rx.recv_timeout(delay),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                )
-            {
-                return;
-            }
-            if stream.write_all(initial_response).is_err() {
-                return;
-            }
-            if let Some(trailing_body) = trailing_body {
+            for (delay, bytes) in script {
                 if !matches!(
                     stop_rx.recv_timeout(delay),
                     Err(mpsc::RecvTimeoutError::Timeout)
                 ) {
                     return;
                 }
-                let _ = stream.write_all(trailing_body);
+                if stream.write_all(bytes).is_err() {
+                    return;
+                }
             }
             let _ = stream.flush();
         });
@@ -629,9 +670,35 @@ mod tests {
         server.join().unwrap();
         let result = result.expect("request should finish within the fixture bound");
         assert!(
-            matches!(&result, Err(crate::error::S3Error::Reqwest(error)) if error.is_timeout()),
+            matches!(&result, Err(crate::error::S3Error::Io(error))
+                if error.kind() == std::io::ErrorKind::TimedOut),
             "delayed headers should exceed the request timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_resets_with_each_body_chunk() {
+        // Three gaps add up to more than the limit; each alone is within it.
+        let gap = Duration::from_millis(400);
+        let (endpoint, stop, server) = mock_http_response(vec![
+            (
+                Duration::ZERO,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n",
+            ),
+            (gap, b"ab"),
+            (gap, b"cd"),
+            (gap, b"ef"),
+        ]);
+        let bucket = timeout_test_bucket(endpoint, Some(Duration::from_secs(1)));
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), bucket.get_object("/object")).await;
+        let _ = stop.send(());
+        server.join().unwrap();
+        let response = response
+            .expect("download should finish within the fixture bound")
+            .expect("a body that keeps arriving must not time out");
+        assert_eq!(response.as_slice(), b"abcdef");
     }
 
     #[tokio::test]
@@ -658,7 +725,8 @@ mod tests {
             .expect("body timeout should be bounded");
         assert!(matches!(
             next.expect("body should report its timeout"),
-            Err(crate::error::S3Error::Reqwest(ref error)) if error.is_timeout()
+            Err(crate::error::S3Error::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
         ));
         let _ = stop.send(());
         server.join().unwrap();
@@ -680,7 +748,8 @@ mod tests {
         let result = result.expect("writer timeout should be bounded");
         assert!(matches!(
             result,
-            Err(crate::error::S3Error::Reqwest(ref error)) if error.is_timeout()
+            Err(crate::error::S3Error::Io(ref error))
+                if error.kind() == std::io::ErrorKind::TimedOut
         ));
         assert_eq!(writer, b"abc", "the complete prefix should be written once");
     }

@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 #[cfg(feature = "with-async-std")]
 pub mod async_std_backend;
 #[cfg(feature = "sync")]
@@ -29,15 +31,22 @@ impl RequestAttemptError {
         }
     }
 
+    /// An error from before the response headers arrived, which a retry-safe command
+    /// retries without looking at it further.
+    #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
+    pub(crate) fn transient(error: S3Error) -> Self {
+        Self {
+            error,
+            retryable: Some(true),
+        }
+    }
+
     #[cfg(feature = "with-async-std")]
     pub(crate) fn surf_send_error(error: surf::Error) -> Self {
         // Surf's transport stack can report connection-close failures without
         // retaining an io::Error source. At this boundary errors come only
         // from send(); replay remains restricted to safe operations.
-        Self {
-            error: S3Error::Surf(error.to_string()),
-            retryable: Some(true),
-        }
+        Self::transient(S3Error::Surf(error.to_string()))
     }
 
     fn should_retry(&self, command: &Command<'_>) -> bool {
@@ -69,6 +78,16 @@ impl From<attohttpc::Error> for RequestAttemptError {
     fn from(error: attohttpc::Error) -> Self {
         S3Error::Atto(error).into()
     }
+}
+
+/// The error for a wait on the server that exceeded the bucket's `request_timeout`: an
+/// `io::Error` of kind `TimedOut` saying what was awaited and for how long.
+#[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
+pub(crate) fn timeout_error(awaited: &str, limit: std::time::Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("no {awaited} within {limit:?}"),
+    )
 }
 
 fn retryable_request_error(command: &Command<'_>, error: &S3Error) -> bool {

@@ -300,6 +300,13 @@ Bypassing the body wrapper made the public-response regression test fail.
 These deadlines do not bound an arbitrary external writer's own blocked write.
 Sync behavior remains transport-specific.
 
+Superseded on 2026-10-16: a total deadline failed any transfer larger than a
+minute's worth of bandwidth (upstream issue #264). `request_timeout` is now an
+inactivity limit in all three backends: the wait for the response headers after
+the request is handed to the transport, then each wait for the next body chunk.
+Timeouts surface as `S3Error::Io` of kind `TimedOut`; the sync backend maps the
+limit onto attohttpc's connect and read timeouts.
+
 ### P2: R2 rejects generated body headers on bodyless requests — repaired and provider-verified
 
 Live R2 tests reproduced HTTP 403 on range GET in Tokio, async-std, and sync,
