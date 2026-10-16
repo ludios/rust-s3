@@ -2203,100 +2203,77 @@ impl Bucket {
             std::num::NonZeroUsize::get,
         );
 
-        // Use FuturesUnordered for bounded parallelism
         use futures_util::FutureExt;
+        use futures_util::future::{Either, select};
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         // Keep all part futures inside this scope. If reading or a part fails,
         // leaving the scope drops the outstanding futures before abort starts.
         let upload_result: Result<(Vec<(u32, String)>, usize), S3Error> = async {
-            let mut part_number: u32 = 0;
-            let mut total_size = 0;
             let mut etags = Vec::new();
             let mut active_uploads: FuturesUnordered<
                 futures_util::future::BoxFuture<'_, (u32, Result<ResponseData, S3Error>)>,
             > = FuturesUnordered::new();
+            let mut chunks = std::pin::pin!(crate::utils::chunk_stream(reader).fuse());
             let mut reading_done = false;
+            let mut total_size = first_chunk.len();
+            let mut part_number: u32 = 1;
 
-            part_number += 1;
-            total_size += first_chunk.len();
-            if first_chunk.len() < CHUNK_SIZE {
-                reading_done = true;
-            }
-
-            let path_clone = path.clone();
-            let upload_id_clone = upload_id.clone();
-            let content_type_clone = content_type.to_string();
-            let part_headers = header_plan.part.clone();
-            let bucket_clone = self.clone();
-
-            active_uploads.push(
+            let upload_part = |chunk: Vec<u8>, part_number: u32| {
+                let bucket = self.clone();
+                let path = path.clone();
+                let upload_id = upload_id.clone();
+                let content_type = content_type.to_string();
+                let part_headers = header_plan.part.clone();
                 async move {
-                    let result = bucket_clone
+                    let result = bucket
                         .make_multipart_request(
-                            &path_clone,
-                            first_chunk,
-                            1,
-                            &upload_id_clone,
-                            &content_type_clone,
+                            &path,
+                            chunk,
+                            part_number,
+                            &upload_id,
+                            &content_type,
                             &part_headers,
                         )
                         .await;
-                    (1, result)
+                    (part_number, result)
                 }
-                .boxed(),
-            );
+                .boxed()
+            };
+            active_uploads.push(upload_part(first_chunk, part_number));
 
-            while !active_uploads.is_empty() || !reading_done {
-                while active_uploads.len() < max_concurrent_chunks && !reading_done {
-                    let chunk = crate::utils::read_chunk_async(reader).await?;
-                    let chunk_len = chunk.len();
-
-                    if chunk_len == 0 {
-                        reading_done = true;
-                        break;
+            // The parts in flight are driven while the next chunk is read, so that a slow
+            // reader neither delays their start nor leaves a finished one unnoticed. Whichever
+            // is ready first is handled; the other keeps its progress.
+            loop {
+                let want_chunk = !reading_done && active_uploads.len() < max_concurrent_chunks;
+                let ready = if !want_chunk && active_uploads.is_empty() {
+                    break;
+                } else if !want_chunk {
+                    Either::Left(active_uploads.next().await.expect("a part is in flight"))
+                } else if active_uploads.is_empty() {
+                    Either::Right(chunks.next().await)
+                } else {
+                    match select(active_uploads.next(), chunks.next()).await {
+                        Either::Left((part, _)) => Either::Left(part.expect("a part is in flight")),
+                        Either::Right((chunk, _)) => Either::Right(chunk),
                     }
-
-                    total_size += chunk_len;
-                    part_number += 1;
-
-                    if chunk_len < CHUNK_SIZE {
-                        reading_done = true;
-                    }
-
-                    let current_part = part_number;
-                    let path_clone = path.clone();
-                    let upload_id_clone = upload_id.clone();
-                    let content_type_clone = content_type.to_string();
-                    let part_headers = header_plan.part.clone();
-                    let bucket_clone = self.clone();
-
-                    active_uploads.push(
-                        async move {
-                            let result = bucket_clone
-                                .make_multipart_request(
-                                    &path_clone,
-                                    chunk,
-                                    current_part,
-                                    &upload_id_clone,
-                                    &content_type_clone,
-                                    &part_headers,
-                                )
-                                .await;
-                            (current_part, result)
+                };
+                match ready {
+                    Either::Left((part_number, result)) => {
+                        let response_data = result?;
+                        if !(200..300).contains(&response_data.status_code()) {
+                            return Err(response_error_from_data(response_data));
                         }
-                        .boxed(),
-                    );
-                }
-
-                if let Some((part_num, result)) = active_uploads.next().await {
-                    let response_data = result?;
-                    if !(200..300).contains(&response_data.status_code()) {
-                        return Err(response_error_from_data(response_data));
+                        etags.push((part_number, response_data.as_str()?.to_string()));
                     }
-
-                    let etag = response_data.as_str()?;
-                    etags.push((part_num, etag.to_string()));
+                    Either::Right(Some(chunk)) => {
+                        let chunk = chunk?;
+                        total_size += chunk.len();
+                        part_number += 1;
+                        active_uploads.push(upload_part(chunk, part_number));
+                    }
+                    Either::Right(None) => reading_done = true,
                 }
             }
 
@@ -4187,20 +4164,23 @@ mod test {
         use std::thread;
         use std::time::{Duration, Instant};
 
+        /// One request from `stream`, or `None` for a connection closed before a request
+        /// line was sent: a part the client gave up on when its upload failed.
         fn read_request(
             stream: &mut std::net::TcpStream,
             deadline: Instant,
-        ) -> Result<MultipartWireRequest, String> {
+        ) -> Result<Option<MultipartWireRequest>, String> {
             let mut raw_headers = Vec::new();
             let mut byte = [0u8; 1];
             while !raw_headers.ends_with(b"\r\n\r\n") {
                 if raw_headers.len() >= 16 * 1024 || Instant::now() >= deadline {
                     return Err("header limit or deadline exceeded".to_owned());
                 }
-                stream
-                    .read_exact(&mut byte)
-                    .map_err(|error| format!("read headers: {error}"))?;
-                raw_headers.push(byte[0]);
+                match stream.read_exact(&mut byte) {
+                    Ok(()) => raw_headers.push(byte[0]),
+                    Err(_) if raw_headers.is_empty() => return Ok(None),
+                    Err(error) => return Err(format!("read headers: {error}")),
+                }
             }
 
             let header_text = String::from_utf8_lossy(&raw_headers);
@@ -4227,11 +4207,11 @@ mod test {
                 .read_exact(&mut body)
                 .map_err(|error| format!("read request body: {error}"))?;
 
-            Ok(MultipartWireRequest {
+            Ok(Some(MultipartWireRequest {
                 line,
                 headers,
                 content_length,
-            })
+            }))
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4264,28 +4244,35 @@ mod test {
             let deadline = Instant::now() + Duration::from_secs(12);
             let mut requests = Vec::new();
             for step in expected {
-                let (mut stream, _) = loop {
-                    if Instant::now() >= deadline {
-                        return Err(format!("accept deadline after {} requests", requests.len()));
-                    }
-                    match listener.accept() {
-                        Ok(pair) => break pair,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
+                let (mut stream, request) = loop {
+                    let (mut stream, _) = loop {
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "accept deadline after {} requests",
+                                requests.len()
+                            ));
                         }
-                        Err(error) => return Err(format!("accept request: {error}")),
+                        match listener.accept() {
+                            Ok(pair) => break pair,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => return Err(format!("accept request: {error}")),
+                        }
+                    };
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|error| error.to_string())?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(4)))
+                        .map_err(|error| error.to_string())?;
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(4)))
+                        .map_err(|error| error.to_string())?;
+                    if let Some(request) = read_request(&mut stream, deadline)? {
+                        break (stream, request);
                     }
                 };
-                stream
-                    .set_nonblocking(false)
-                    .map_err(|error| error.to_string())?;
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(4)))
-                    .map_err(|error| error.to_string())?;
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(4)))
-                    .map_err(|error| error.to_string())?;
-                let request = read_request(&mut stream, deadline)?;
 
                 let (status, body, etag) = match step {
                     "init" => {
@@ -4351,7 +4338,7 @@ mod test {
                             stream
                                 .set_read_timeout(Some(Duration::from_secs(4)))
                                 .map_err(|error| error.to_string())?;
-                            requests.push(read_request(&mut stream, deadline)?);
+                            requests.extend(read_request(&mut stream, deadline)?);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(error) => return Err(format!("final accept check: {error}")),
@@ -4372,8 +4359,7 @@ mod test {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(4)))
                             .map_err(|error| error.to_string())?;
-                        let request = read_request(&mut stream, deadline)?;
-                        requests.push(request);
+                        requests.extend(read_request(&mut stream, deadline)?);
                         return Ok(requests);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -5108,21 +5094,27 @@ mod test {
         use std::thread;
         use std::time::{Duration, Instant};
 
+        /// One request from `stream`, its line and body length, or `None` for a connection
+        /// closed before a request line was sent: a part the client gave up on when its
+        /// upload failed.
         fn read_request(
             stream: &mut std::net::TcpStream,
             request_index: usize,
             deadline: Instant,
-        ) -> Result<(String, usize), String> {
+        ) -> Result<Option<(String, usize)>, String> {
             let mut header_bytes = Vec::new();
             let mut byte = [0u8; 1];
             while !header_bytes.ends_with(b"\r\n\r\n") {
                 if header_bytes.len() >= 16 * 1024 || Instant::now() >= deadline {
                     return Err(format!("header bounds exceeded at request {request_index}"));
                 }
-                stream
-                    .read_exact(&mut byte)
-                    .map_err(|error| format!("read headers at {request_index}: {error}"))?;
-                header_bytes.push(byte[0]);
+                match stream.read_exact(&mut byte) {
+                    Ok(()) => header_bytes.push(byte[0]),
+                    Err(_) if header_bytes.is_empty() => return Ok(None),
+                    Err(error) => {
+                        return Err(format!("read headers at {request_index}: {error}"));
+                    }
+                }
             }
             let header_text = String::from_utf8_lossy(&header_bytes);
             let request_line = header_text.lines().next().unwrap_or_default().to_owned();
@@ -5142,7 +5134,7 @@ mod test {
             stream
                 .read_exact(&mut request_body)
                 .map_err(|error| format!("read body at {request_index}: {error}"))?;
-            Ok((request_line, content_length))
+            Ok(Some((request_line, content_length)))
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5209,50 +5201,55 @@ mod test {
             for (step_index, (expected_method, expected_query, status, body, with_etag)) in
                 steps.into_iter().enumerate()
             {
-                let (mut stream, _) = loop {
-                    match listener.accept() {
-                        Ok(pair) => break pair,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            if let Ok(client_result) = done_rx.try_recv() {
+                let (mut stream, request_line) = loop {
+                    let (mut stream, _) = loop {
+                        match listener.accept() {
+                            Ok(pair) => break pair,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if let Ok(client_result) = done_rx.try_recv() {
+                                    return Err(format!(
+                                        "case {case:?}: client completed before request {} (expected {expected_method}...{expected_query}) after {} requests; client result: {client_result}",
+                                        step_index + 1,
+                                        requests.len(),
+                                    ));
+                                }
+                                if Instant::now() >= deadline {
+                                    return Err(format!(
+                                        "case {case:?}: accept deadline after {} requests; awaiting request {} expected {expected_method}...{expected_query}",
+                                        requests.len(),
+                                        step_index + 1,
+                                    ));
+                                }
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => {
                                 return Err(format!(
-                                    "case {case:?}: client completed before request {} (expected {expected_method}...{expected_query}) after {} requests; client result: {client_result}",
+                                    "case {case:?}: accept failed before request {} expected {expected_method}...{expected_query}: {error}",
                                     step_index + 1,
-                                    requests.len(),
                                 ));
                             }
-                            if Instant::now() >= deadline {
-                                return Err(format!(
-                                    "case {case:?}: accept deadline after {} requests; awaiting request {} expected {expected_method}...{expected_query}",
-                                    requests.len(),
-                                    step_index + 1,
-                                ));
-                            }
-                            thread::sleep(Duration::from_millis(5));
                         }
-                        Err(error) => {
-                            return Err(format!(
-                                "case {case:?}: accept failed before request {} expected {expected_method}...{expected_query}: {error}",
+                    };
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|error| format!("set blocking: {error}"))?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .map_err(|error| format!("set read timeout: {error}"))?;
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(3)))
+                        .map_err(|error| format!("set write timeout: {error}"))?;
+                    let request = read_request(&mut stream, requests.len() + 1, deadline)
+                        .map_err(|error| {
+                            format!(
+                                "case {case:?}: reading request {} expected {expected_method}...{expected_query}: {error}",
                                 step_index + 1,
-                            ));
-                        }
+                            )
+                        })?;
+                    if let Some((request_line, _)) = request {
+                        break (stream, request_line);
                     }
                 };
-                stream
-                    .set_nonblocking(false)
-                    .map_err(|error| format!("set blocking: {error}"))?;
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .map_err(|error| format!("set read timeout: {error}"))?;
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .map_err(|error| format!("set write timeout: {error}"))?;
-                let (request_line, _) = read_request(&mut stream, requests.len() + 1, deadline)
-                    .map_err(|error| {
-                        format!(
-                            "case {case:?}: reading request {} expected {expected_method}...{expected_query}: {error}",
-                            step_index + 1,
-                        )
-                    })?;
                 if !request_line.starts_with(expected_method)
                     || !request_line.contains(expected_query)
                 {
@@ -5298,17 +5295,16 @@ mod test {
                         stream
                             .set_write_timeout(Some(Duration::from_secs(3)))
                             .map_err(|error| format!("set extra write timeout: {error}"))?;
-                        let (request_line, _) = read_request(
-                            &mut stream,
-                            requests.len() + 1,
-                            deadline,
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "case {case:?}: reading unexpected request after {} expected requests: {error}",
-                                requests.len(),
-                            )
-                        })?;
+                        let request = read_request(&mut stream, requests.len() + 1, deadline)
+                            .map_err(|error| {
+                                format!(
+                                    "case {case:?}: reading unexpected request after {} expected requests: {error}",
+                                    requests.len(),
+                                )
+                            })?;
+                        let Some((request_line, _)) = request else {
+                            continue;
+                        };
                         requests.push(format!("unexpected extra request: {request_line}"));
                         stream
                             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")

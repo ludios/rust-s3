@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 mod time_utils;
 
 pub use time_utils::*;
@@ -92,6 +94,24 @@ pub async fn read_chunk_async<R: AsyncRead + Unpin + ?Sized>(
     take.read_to_end(&mut chunk).await?;
 
     Ok(chunk)
+}
+
+/// The chunks of `reader` as a stream, each `CHUNK_SIZE` long but the last: a short one ends
+/// the stream after it, an empty one at once. Unlike a `read_chunk_async` future, the stream
+/// keeps a partly read chunk when the `next()` polling it is dropped, so a read can be raced
+/// against other work.
+#[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
+pub fn chunk_stream<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, S3Error>> + '_ {
+    futures_util::stream::try_unfold((reader, false), |(reader, done)| async move {
+        if done {
+            return Ok(None);
+        }
+        let chunk = read_chunk_async(reader).await?;
+        let done = chunk.len() < CHUNK_SIZE;
+        Ok((!chunk.is_empty()).then_some((chunk, (reader, done))))
+    })
 }
 
 pub trait GetAndConvertHeaders {
