@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 //! # Rust S3 Bucket Operations
 //!
@@ -3313,7 +3314,9 @@ impl Bucket {
         Ok((list_bucket_result, response_data.status_code()))
     }
 
-    /// List the contents of an S3 bucket.
+    /// List the contents of an S3 bucket, one [`ListBucketResult`] per page, following every
+    /// page of a truncated listing. Returns [`S3Error::InvalidListObjectsPagination`] if a
+    /// truncated page has no cursor to continue from, or repeats an earlier one.
     ///
     /// # Example:
     ///
@@ -3347,18 +3350,17 @@ impl Bucket {
     /// # }
     /// ```
     #[maybe_async::maybe_async]
-    #[allow(clippy::assigning_clones)]
     pub async fn list(
         &self,
         prefix: String,
         delimiter: Option<String>,
     ) -> Result<Vec<ListBucketResult>, S3Error> {
-        let the_bucket = self.to_owned();
         let mut results = Vec::new();
         let mut continuation_token = None;
+        let mut seen_cursors = HashSet::new();
 
         loop {
-            let (list_bucket_result, _) = the_bucket
+            let (list_bucket_result, _) = self
                 .list_page(
                     prefix.clone(),
                     delimiter.clone(),
@@ -3367,14 +3369,51 @@ impl Bucket {
                     None,
                 )
                 .await?;
-            continuation_token = list_bucket_result.next_continuation_token.clone();
-            results.push(list_bucket_result);
-            if continuation_token.is_none() {
+
+            if !list_bucket_result.is_truncated {
+                results.push(list_bucket_result);
                 break;
             }
+
+            let cursor = self.next_list_cursor(&list_bucket_result).ok_or(
+                S3Error::InvalidListObjectsPagination(
+                    "truncated response has no continuation cursor",
+                ),
+            )?;
+            if !seen_cursors.insert(cursor.clone()) {
+                return Err(S3Error::InvalidListObjectsPagination(
+                    "pagination cursor repeated",
+                ));
+            }
+
+            continuation_token = Some(cursor);
+            results.push(list_bucket_result);
         }
 
         Ok(results)
+    }
+
+    /// The `continuation_token` that continues the listing after `page`, a truncated page from
+    /// [`Self::list_page`], or `None` if the page has no cursor. ListObjects v1 services send
+    /// `NextMarker` only when the request had a delimiter; when it is absent, the listing
+    /// continues after the greatest key or common prefix on the page.
+    fn next_list_cursor(&self, page: &ListBucketResult) -> Option<String> {
+        let cursor = page
+            .next_continuation_token
+            .clone()
+            .filter(|cursor| !cursor.is_empty());
+        if self.listobjects_v2 {
+            return cursor;
+        }
+        cursor.or_else(|| {
+            let last_key = page.contents.last().map(|object| &object.key);
+            let last_prefix = page
+                .common_prefixes
+                .as_ref()
+                .and_then(|prefixes| prefixes.last())
+                .map(|prefix| &prefix.prefix);
+            last_key.max(last_prefix).cloned()
+        })
     }
 
     /// List one page of in-progress multipart uploads. Pass both returned cursor markers to

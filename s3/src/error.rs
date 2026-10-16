@@ -1,3 +1,5 @@
+// Model-output: Claude Opus 5.5
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -13,6 +15,8 @@ pub enum S3Error {
     HttpFail,
     #[error("invalid multipart uploads pagination: {0}")]
     InvalidMultipartUploadsPagination(&'static str),
+    #[error("invalid object listing pagination: {0}")]
+    InvalidListObjectsPagination(&'static str),
     #[error("header '{0}' cannot be applied to a streamed multipart upload")]
     UnsupportedMultipartHeader(http::header::HeaderName),
     #[error("aws-creds: {0}")]
