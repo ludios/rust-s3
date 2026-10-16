@@ -8,11 +8,51 @@
 mod fake_s3;
 
 use fake_s3::{BUCKET, bucket, http, reply, serve, within};
+use s3::Bucket;
 use s3::error::S3Error;
 
-/// Whether `result` is the refusal of `key` for its dot segment.
-fn refused<T>(result: &Result<T, S3Error>, key: &str) -> bool {
-    matches!(result, Err(S3Error::DotSegmentKey(refused)) if refused == key)
+/// The message of the error `result` failed with, if it failed.
+fn error_message<T>(result: Result<T, S3Error>) -> Option<String> {
+    result.err().map(|error| error.to_string())
+}
+
+/// Asserts that deleting `key`, putting it, and presigning a GET or a DELETE of it all fail
+/// with `refusal`.
+async fn assert_refused(bucket: &Bucket, key: &str, refusal: S3Error) {
+    let refusal = Some(refusal.to_string());
+    let deleted = within(bucket.delete_object(key)).await;
+    assert_eq!(error_message(deleted), refusal, "delete_object({key:?})");
+    let put = within(bucket.put_object(key, b"body")).await;
+    assert_eq!(error_message(put), refusal, "put_object({key:?})");
+    let presigned_get = within(bucket.presign_get(key, 60, None)).await;
+    assert_eq!(
+        error_message(presigned_get),
+        refusal,
+        "presign_get({key:?})"
+    );
+    let presigned_delete = within(bucket.presign_delete(key, 60)).await;
+    assert_eq!(
+        error_message(presigned_delete),
+        refusal,
+        "presign_delete({key:?})"
+    );
+}
+
+#[tokio::test]
+async fn empty_keys_are_refused_and_only_delete_deletes_the_bucket() {
+    let (endpoint, server) = serve(vec![reply(http("204 No Content", &[], b""))]).await;
+    let bucket = bucket(&endpoint);
+
+    // Both would address `/test-bucket/`, where a DELETE is a DeleteBucket.
+    for key in ["", "/"] {
+        assert_refused(&bucket, key, S3Error::EmptyKey(key.to_owned())).await;
+    }
+    within(bucket.delete()).await.unwrap();
+    let heads = within(server).await.unwrap();
+
+    assert_eq!(heads.len(), 1);
+    let request_line = heads[0].lines().next().unwrap();
+    assert_eq!(request_line, format!("DELETE /{BUCKET}/ HTTP/1.1"));
 }
 
 #[tokio::test]
@@ -31,12 +71,7 @@ async fn keys_with_a_dot_segment_are_refused_and_other_dots_are_sent_unchanged()
         "..",
         "/..",
     ] {
-        let deleted = within(bucket.delete_object(key)).await;
-        assert!(refused(&deleted, key), "{key:?}: {deleted:?}");
-        let put = within(bucket.put_object(key, b"body")).await;
-        assert!(refused(&put, key), "{key:?}: {put:?}");
-        let presigned = within(bucket.presign_get(key, 60, None)).await;
-        assert!(refused(&presigned, key), "{key:?}: {presigned:?}");
+        assert_refused(&bucket, key, S3Error::DotSegmentKey(key.to_owned())).await;
     }
     within(bucket.delete_object("/.a/.../b./..c"))
         .await

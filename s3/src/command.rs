@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 //! This module defines and manages various commands used for interacting with Amazon S3, encapsulating common operations such as creating buckets, uploading objects, and managing multipart uploads.
 //! It also provides utilities for calculating necessary metadata (like content length and SHA-256 hashes) required for secure and efficient communication with the S3 service.
@@ -222,6 +223,48 @@ impl<'a> Command<'a> {
                 ..
             }
         )
+    }
+
+    /// Whether this command addresses one object, named by a key in the request's path,
+    /// rather than the bucket or the service.
+    pub(crate) fn addresses_object(&self) -> bool {
+        match self {
+            Command::HeadObject
+            | Command::CopyObject { .. }
+            | Command::DeleteObject
+            | Command::DeleteObjectTagging
+            | Command::GetObject
+            | Command::GetObjectTorrent
+            | Command::GetObjectRange { .. }
+            | Command::GetObjectTagging
+            | Command::GetObjectAttributes { .. }
+            | Command::PutObject { .. }
+            | Command::PutObjectTagging { .. }
+            | Command::PresignGet { .. }
+            | Command::PresignPut { .. }
+            | Command::PresignDelete { .. }
+            | Command::InitiateMultipartUpload { .. }
+            | Command::UploadPart { .. }
+            | Command::AbortMultipartUpload { .. }
+            | Command::CompleteMultipartUpload { .. } => true,
+            Command::ListBuckets
+            | Command::CreateBucket { .. }
+            | Command::DeleteBucket
+            | Command::GetBucketLocation
+            | Command::ListObjects { .. }
+            | Command::ListObjectsV2 { .. }
+            | Command::ListMultipartUploads { .. }
+            | Command::DeleteObjects { .. }
+            | Command::GetBucketCors { .. }
+            | Command::PutBucketCors { .. }
+            | Command::DeleteBucketCors { .. }
+            | Command::GetBucketLifecycle
+            | Command::PutBucketLifecycle { .. }
+            | Command::DeleteBucketLifecycle
+            | Command::GetBucketPolicy
+            | Command::PutBucketPolicy { .. }
+            | Command::DeleteBucketPolicy => false,
+        }
     }
 
     pub fn http_verb(&self) -> HttpMethod {

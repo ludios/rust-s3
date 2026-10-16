@@ -771,9 +771,10 @@ pub trait Request {
     }
 
     /// The URL this request is sent to, or presigned for: the bucket's URL, then the object key
-    /// percent-encoded, then the command's query. Fails with `S3Error::DotSegmentKey` for a
-    /// key with a `.` or `..` segment, which URL parsing would resolve into another key, or
-    /// in path style into another bucket.
+    /// percent-encoded, then the command's query. Fails with `S3Error::EmptyKey` for an object
+    /// command whose key is empty, which would address the bucket itself, and with
+    /// `S3Error::DotSegmentKey` for a key with a `.` or `..` segment, which URL parsing would
+    /// resolve into another key, or in path style into another bucket.
     fn url(&self) -> Result<Url, S3Error> {
         let mut url_str = self.bucket().url();
 
@@ -790,6 +791,9 @@ pub trait Request {
         } else {
             self.path()[..].to_string()
         };
+        if path.is_empty() && self.command().addresses_object() {
+            return Err(S3Error::EmptyKey(self.path().to_string()));
+        }
         if path
             .split('/')
             .any(|segment| segment == "." || segment == "..")
