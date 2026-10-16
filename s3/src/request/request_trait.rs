@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 use base64::Engine;
 use base64::engine::general_purpose;
@@ -769,6 +770,10 @@ pub trait Request {
         Ok(url)
     }
 
+    /// The URL this request is sent to, or presigned for: the bucket's URL, then the object key
+    /// percent-encoded, then the command's query. Fails with `S3Error::DotSegmentKey` for a
+    /// key with a `.` or `..` segment, which URL parsing would resolve into another key, or
+    /// in path style into another bucket.
     fn url(&self) -> Result<Url, S3Error> {
         let mut url_str = self.bucket().url();
 
@@ -785,9 +790,16 @@ pub trait Request {
         } else {
             self.path()[..].to_string()
         };
+        if path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return Err(S3Error::DotSegmentKey(path));
+        }
+        let encoded_path = signing::uri_encode(&path, false);
 
         url_str.push('/');
-        url_str.push_str(&signing::uri_encode(&path, false));
+        url_str.push_str(&encoded_path);
 
         // Append to url_path
         #[allow(clippy::collapsible_match)]
@@ -853,6 +865,13 @@ pub trait Request {
         }
 
         let mut url = Url::parse(&url_str)?;
+        // With dot segments refused and every other character URL parsing could rewrite
+        // percent-encoded, the path keeps the key exactly as encoded.
+        debug_assert!(
+            url.path().ends_with(&format!("/{encoded_path}")),
+            "URL parsing rewrote the path of {url_str:?} to {:?}",
+            url.path()
+        );
 
         for (key, value) in &self.bucket().extra_query {
             url.query_pairs_mut().append_pair(key, value);

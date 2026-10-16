@@ -19,6 +19,10 @@ pub enum S3Error {
     InvalidListObjectsPagination(&'static str),
     #[error("header '{0}' cannot be applied to a streamed multipart upload")]
     UnsupportedMultipartHeader(http::header::HeaderName),
+    /// An object key with a `.` or `..` path segment, refused before any request or presigned
+    /// URL is built: URL parsing would resolve the segment and address a different object.
+    #[error("object key {0:?} has a '.' or '..' segment, which a URL cannot carry unchanged")]
+    DotSegmentKey(String),
     #[error("aws-creds: {0}")]
     Credentials(#[from] crate::creds::error::CredentialsError),
     #[error("aws-region: {0}")]
