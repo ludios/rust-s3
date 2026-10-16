@@ -12,6 +12,11 @@ pub use request_trait::*;
 
 #[cfg(test)]
 mod retry_tests;
+#[cfg(all(
+    test,
+    any(feature = "sync", feature = "with-tokio", feature = "with-async-std")
+))]
+mod url_tests;
 
 use crate::command::Command;
 #[cfg(any(feature = "with-async-std", feature = "sync"))]
