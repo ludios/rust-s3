@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 use base64::Engine;
 use base64::engine::general_purpose;
 use hmac::Mac;
@@ -270,10 +272,15 @@ pub type DataStream = Pin<Box<dyn Stream<Item = StreamItem> + Send>>;
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 pub type StreamItem = Result<Bytes, S3Error>;
 
+/// A response whose body is still arriving: `status_code` and `headers` are complete, and
+/// `bytes` yields the body as the server sends it.
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 pub struct ResponseDataStream {
     pub bytes: DataStream,
     pub status_code: u16,
+    /// The response headers. A ranged GET's `Content-Length` and `Content-Range` say what
+    /// the body will hold before any of it is read.
+    pub headers: HeaderMap,
 }
 
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
@@ -1167,6 +1174,7 @@ mod tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         // Read all data using AsyncRead
@@ -1187,6 +1195,7 @@ mod tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         let mut output = Vec::new();
@@ -1222,6 +1231,7 @@ mod tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         // First read should succeed
@@ -1250,6 +1260,7 @@ mod tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         let mut output = Vec::new();
@@ -1283,6 +1294,7 @@ mod async_std_tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         // Read all data using AsyncRead
@@ -1303,6 +1315,7 @@ mod async_std_tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         let mut output = Vec::new();
@@ -1338,6 +1351,7 @@ mod async_std_tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         // First read should succeed
@@ -1366,6 +1380,7 @@ mod async_std_tests {
         let mut response_stream = ResponseDataStream {
             bytes: data_stream,
             status_code: 200,
+            headers: HeaderMap::new(),
         };
 
         let mut output = Vec::new();

@@ -345,12 +345,14 @@ impl<'a> Request for ReqwestRequest<'a> {
     async fn response_data_to_stream(&self) -> Result<ResponseDataStream, S3Error> {
         let (response, observer) =
             crate::request::retry_request(&self.command, || request_response_attempt(self)).await?;
-        let status_code = response.status();
+        let status_code = response.status().as_u16();
+        let headers = response.headers().clone();
         let stream = ObservedBody::new(response, observer).map_err(S3Error::Reqwest);
 
         Ok(ResponseDataStream {
             bytes: Box::pin(stream),
-            status_code: status_code.as_u16(),
+            status_code,
+            headers,
         })
     }
 

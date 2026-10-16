@@ -120,6 +120,7 @@ while `tokio` methods are generic over `tokio::io::AsyncWriteExt`.
 | --------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `async/sync/async-blocking` | [get_object](https://docs.rs/rust-s3/latest/s3/bucket/struct.Bucket.html#method.get_object)                     |
 | `async/sync/async-blocking` | [get_object_stream](https://docs.rs/rust-s3/latest/s3/bucket/struct.Bucket.html#method.get_object_stream)       |
+| `async/sync/async-blocking` | [get_object_range_stream](https://docs.rs/rust-s3/latest/s3/bucket/struct.Bucket.html#method.get_object_range_stream) |
 | `async/sync/async-blocking` | [get_object_to_writer](https://docs.rs/rust-s3/latest/s3/bucket/struct.Bucket.html#method.get_object_to_writer) |
 
 #### PUT

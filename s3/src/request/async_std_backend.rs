@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 use async_std::io::ReadExt;
 use async_std::io::Write as AsyncWrite;
 use bytes::Bytes;
@@ -216,6 +218,20 @@ async fn surf_response_attempt(
     Ok(response)
 }
 
+/// `response`'s headers as an `http::HeaderMap`.
+fn header_map(response: &surf::Response) -> Result<HeaderMap, S3Error> {
+    let mut header_map = HeaderMap::new();
+    for (name, value) in response.iter() {
+        header_map.insert(
+            http::header::HeaderName::from_lowercase(
+                name.to_string().to_ascii_lowercase().as_ref(),
+            )?,
+            value.as_str().parse()?,
+        );
+    }
+    Ok(header_map)
+}
+
 #[maybe_async]
 impl<'a> Request for SurfRequest<'a> {
     type Response = surf::Response;
@@ -344,32 +360,25 @@ impl<'a> Request for SurfRequest<'a> {
     }
 
     async fn response_header(&self) -> Result<(HeaderMap, u16), S3Error> {
-        let mut header_map = HeaderMap::new();
         let response =
             crate::request::retry_request(&self.command, || surf_response_attempt(self)).await?;
         let status_code = response.status();
 
-        for (name, value) in response.iter() {
-            header_map.insert(
-                http::header::HeaderName::from_lowercase(
-                    name.to_string().to_ascii_lowercase().as_ref(),
-                )?,
-                value.as_str().parse()?,
-            );
-        }
-        Ok((header_map, status_code.into()))
+        Ok((header_map(&response)?, status_code.into()))
     }
 
     async fn response_data_to_stream(&self) -> Result<ResponseDataStream, S3Error> {
         let mut response =
             crate::request::retry_request(&self.command, || surf_response_attempt(self)).await?;
         let status_code = response.status();
+        let headers = header_map(&response)?;
 
         let body = body_stream(response.take_body());
 
         Ok(ResponseDataStream {
             bytes: body,
             status_code: status_code.into(),
+            headers,
         })
     }
 }

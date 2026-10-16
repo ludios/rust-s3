@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 //! # Rust S3 Bucket Operations
 //!
 //! This module provides functionality for interacting with S3 buckets and objects,
@@ -1830,6 +1832,57 @@ impl Bucket {
         path: S,
     ) -> Result<ResponseDataStream, S3Error> {
         let command = Command::GetObject;
+        let request = RequestImpl::new(self, path.as_ref(), command).await?;
+        request.response_data_to_stream().await
+    }
+
+    /// Stream bytes `start..=end` of the object at `path`, or `start..` to its end when `end`
+    /// is `None`. A satisfiable range is answered with status 206, and the stream's `headers`
+    /// carry its `Content-Length` and `Content-Range`.
+    ///
+    /// # Example:
+    ///
+    /// ```rust,no_run
+    /// use s3::bucket::Bucket;
+    /// use s3::creds::Credentials;
+    /// use anyhow::Result;
+    /// #[cfg(feature = "with-tokio")]
+    /// use tokio_stream::StreamExt;
+    /// #[cfg(feature = "with-async-std")]
+    /// use async_std::stream::StreamExt;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    ///
+    /// let bucket_name = "rust-s3-test";
+    /// let region = "us-east-1".parse()?;
+    /// let credentials = Credentials::default()?;
+    /// let bucket = Bucket::new(bucket_name, region, credentials)?;
+    ///
+    /// // The first 32 bytes of the object
+    /// let mut response_data_stream = bucket.get_object_range_stream("/test.file", 0, Some(31)).await?;
+    /// assert_eq!(response_data_stream.status_code, 206);
+    ///
+    /// let mut read = Vec::new();
+    /// while let Some(chunk) = response_data_stream.bytes().next().await {
+    ///     read.extend_from_slice(&chunk?);
+    /// }
+    /// #
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
+    pub async fn get_object_range_stream<S: AsRef<str>>(
+        &self,
+        path: S,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<ResponseDataStream, S3Error> {
+        if let Some(end) = end {
+            assert!(start <= end, "range start {start} is past its end {end}");
+        }
+
+        let command = Command::GetObjectRange { start, end };
         let request = RequestImpl::new(self, path.as_ref(), command).await?;
         request.response_data_to_stream().await
     }
