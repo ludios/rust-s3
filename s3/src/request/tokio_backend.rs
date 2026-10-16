@@ -50,7 +50,16 @@ pub(crate) fn client(options: &ClientOptions) -> Result<reqwest::Client, S3Error
     // Request timeouts are applied to individual requests so changing a
     // Bucket's timeout does not require rebuilding this client (or lose its
     // proxy/TLS configuration).
-    let client = reqwest::Client::builder();
+    //
+    // An object's Content-Encoding is metadata about its stored bytes, which are what a
+    // download must return, so the client neither asks for a compressed transfer nor decodes
+    // one. Each of these is a no-op unless some crate in the build enables the matching
+    // reqwest feature, which would otherwise switch both on here.
+    let client = reqwest::Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate();
 
     let client = if let Some(ref proxy) = options.proxy {
         client.proxy(proxy.clone())

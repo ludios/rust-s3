@@ -5,8 +5,9 @@ extern crate md5;
 
 use std::io;
 use std::io::Write;
+use std::sync::OnceLock;
 
-use attohttpc::header::HeaderName;
+use attohttpc::header::{ACCEPT_ENCODING, CONTENT_ENCODING, HeaderName};
 
 use crate::bucket::Bucket;
 use crate::command::Command;
@@ -17,7 +18,7 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 
 use crate::command::HttpMethod;
-use crate::request::{Request, ResponseData};
+use crate::request::{Request, RequestAttemptError, ResponseData};
 
 // Temporary structure for making a request
 pub struct AttoRequest<'a> {
@@ -43,26 +44,74 @@ fn session(request: &AttoRequest<'_>) -> Result<attohttpc::Session, S3Error> {
     Ok(session)
 }
 
+/// Whether this build's attohttpc decodes a response body whose `Content-Encoding` is gzip or
+/// deflate before handing it over. It does whenever any crate in the build enables its
+/// `compress` feature, and nothing can switch that off. The same feature makes a default
+/// request advertise `Accept-Encoding`, which is what this looks for: both hang off attohttpc's
+/// `flate2` dependency.
+fn attohttpc_decodes_bodies() -> bool {
+    static DECODES: OnceLock<bool> = OnceLock::new();
+    *DECODES.get_or_init(|| {
+        attohttpc::RequestBuilder::new(attohttpc::Method::GET, "http://localhost/")
+            .prepare()
+            .headers()
+            .contains_key(ACCEPT_ENCODING)
+    })
+}
+
+/// The `Content-Encoding` of `response` if attohttpc decoded its body on the way in, which
+/// per [`attohttpc_decodes_bodies`] it may do to a gzip or deflate one. The response to a
+/// HEAD has no body to decode.
+fn decoded_encoding(request: &AttoRequest<'_>, response: &attohttpc::Response) -> Option<String> {
+    if request.command.http_verb() == HttpMethod::Head || !attohttpc_decodes_bodies() {
+        return None;
+    }
+    let encodings: Vec<&str> = response
+        .headers()
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let decoded = encodings
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|item| item.eq_ignore_ascii_case("gzip") || item.eq_ignore_ascii_case("deflate"));
+    decoded.then(|| encodings.join(", "))
+}
+
+/// Sends `request` once, through [`session`], to its URL with its body, and returns whatever
+/// response arrives.
+fn send(request: &AttoRequest<'_>) -> Result<attohttpc::Response, RequestAttemptError> {
+    let session = session(request)?;
+    let url = request.url()?;
+    let builder = match request.command.http_verb() {
+        HttpMethod::Get => session.get(url),
+        HttpMethod::Delete => session.delete(url),
+        HttpMethod::Put => session.put(url),
+        HttpMethod::Post => session.post(url),
+        HttpMethod::Head => session.head(url),
+    };
+    Ok(builder.bytes(&request.request_body()?).send()?)
+}
+
+/// Sends `request` once and returns its response, or the failure its status reports under
+/// `fail-on-err`, or a refusal if attohttpc decoded its body: the stored bytes are gone.
 fn atto_response_attempt(
     request: &AttoRequest<'_>,
-) -> Result<attohttpc::Response, crate::request::RequestAttemptError> {
-    let session = session(request)?;
-    let builder = match request.command.http_verb() {
-        HttpMethod::Get => session.get(request.url()?),
-        HttpMethod::Delete => session.delete(request.url()?),
-        HttpMethod::Put => session.put(request.url()?),
-        HttpMethod::Post => session.post(request.url()?),
-        HttpMethod::Head => session.head(request.url()?),
-    };
-    let response = builder.bytes(&request.request_body()?).send()?;
+) -> Result<attohttpc::Response, RequestAttemptError> {
+    let response = send(request)?;
     if cfg!(feature = "fail-on-err") && !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = response.text().map_err(|error| {
-            crate::request::RequestAttemptError::do_not_retry(S3Error::Atto(error))
-        })?;
+        let body = response
+            .text()
+            .map_err(|error| RequestAttemptError::do_not_retry(S3Error::Atto(error)))?;
         return Err(S3Error::HttpFailWithBody(status, body).into());
     }
-    Ok(response)
+    match decoded_encoding(request, &response) {
+        Some(encoding) => Err(S3Error::AttoDecodedBody(encoding).into()),
+        None => Ok(response),
+    }
 }
 
 impl<'a> Request for AttoRequest<'a> {
@@ -91,24 +140,14 @@ impl<'a> Request for AttoRequest<'a> {
 
     fn response_status(&self) -> Result<u16, S3Error> {
         crate::request::retry_request_sync(&self.command, || {
-            let session = session(self)?;
-            let request = match self.command.http_verb() {
-                HttpMethod::Get => session.get(self.url()?),
-                HttpMethod::Delete => session.delete(self.url()?),
-                HttpMethod::Put => session.put(self.url()?),
-                HttpMethod::Post => session.post(self.url()?),
-                HttpMethod::Head => session.head(self.url()?),
-            };
-
-            let response = request.bytes(&self.request_body()?).send()?;
+            let response = send(self)?;
             let status = response.status().as_u16();
-
             if status == 404 {
                 Ok(status)
             } else if cfg!(feature = "fail-on-err") && !response.status().is_success() {
-                let text = response.text().map_err(|error| {
-                    crate::request::RequestAttemptError::do_not_retry(S3Error::Atto(error))
-                })?;
+                let text = response
+                    .text()
+                    .map_err(|error| RequestAttemptError::do_not_retry(S3Error::Atto(error)))?;
                 Err(S3Error::HttpFailWithBody(status, text).into())
             } else {
                 Ok(status)

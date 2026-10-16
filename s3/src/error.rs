@@ -1,4 +1,5 @@
 // Model-output: Claude Opus 5.5
+// Model-output: Claude Fable 5.1
 
 use thiserror::Error;
 
@@ -72,6 +73,11 @@ pub enum S3Error {
     #[cfg(feature = "sync")]
     #[error("attohttpc: {0}")]
     AttoHeaderName(#[from] attohttpc::header::InvalidHeaderName),
+    #[cfg(feature = "sync")]
+    #[error(
+        "attohttpc decoded this body (Content-Encoding: {0}) before rust-s3 could return it as stored: a crate in this build enables attohttpc's `compress` feature, whose decoder cannot be switched off; `cargo tree -e features -i attohttpc` names the crate"
+    )]
+    AttoDecodedBody(String),
     #[error("Could not get Write lock on Credentials")]
     WLCredentials,
     #[error("Could not get Read lock on Credentials")]

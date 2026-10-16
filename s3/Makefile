@@ -1,3 +1,5 @@
+# Model-output: Claude Fable 5.1
+
 # Keep CI, matrix, and integration phases serial: concurrent feature builds
 # contend for the shared target directory and can hit the same providers.
 .NOTPARALLEL: ci ci-tokio ci-async-std ci-sync test-all test-all-features \
@@ -29,6 +31,7 @@
 	sync-fail-on-err-test sync-test-docs fmt fmt-check \
 	tokio-nativetls-clippy tokio-nossl-clippy tokio-rustlstls-clippy \
 	tokio-rustls-ring-clippy tokio-rustls-ring-test-not-ignored \
+	tokio-gzip-test-not-ignored sync-compress-test-not-ignored \
 	async-std-clippy-base async-std-clippy-native-tls async-std-clippy-rustls-tls
 
 # Full S3 CI: formatting, all ten library configurations, representative docs,
@@ -79,7 +82,7 @@ async-std-clippy: async-std-clippy-base async-std-clippy-native-tls async-std-cl
 sync-clippy: sync-nativetls-clippy sync-nossl-clippy sync-rustlstls-clippy
 
 # Tokio library tests: native TLS, no TLS, and rustls with both crypto providers.
-tokio-test-not-ignored: tokio-nativetls-test-not-ignored tokio-nossl-test-not-ignored tokio-rustlstls-test-not-ignored tokio-rustls-ring-test-not-ignored
+tokio-test-not-ignored: tokio-nativetls-test-not-ignored tokio-nossl-test-not-ignored tokio-rustlstls-test-not-ignored tokio-rustls-ring-test-not-ignored tokio-gzip-test-not-ignored
 tokio: tokio-test-not-ignored
 tokio-nativetls-test: tokio-nativetls-test-not-ignored
 tokio-nativetls-clippy:
@@ -110,6 +113,11 @@ tokio-rustls-ring-clippy:
 	cargo clippy --no-default-features --features tokio-rustls-tls-ring --features aws-creds/http-credentials -- -D warnings
 tokio-rustls-ring-test-not-ignored:
 	cargo test --tests --examples --no-default-features --features tokio-rustls-tls-ring --features aws-creds/http-credentials
+
+# Any crate in a build can enable reqwest's `gzip` (likewise brotli, zstd, deflate); the
+# client must still return stored bytes.
+tokio-gzip-test-not-ignored:
+	cargo test --test content_encoding --features reqwest/gzip
 
 # async-std library tests: base/no TLS, native TLS, and rustls.
 async-std-test-not-ignored: async-std-test-not-ignored-base async-std-test-not-ignored-native-tls async-std-test-not-ignored-rustls-tls async-std-fail-on-err-test
@@ -152,7 +160,7 @@ async-std-test-blocking-ignored-rustls-tls:
 
 # Sync library tests: native TLS, rustls, and no TLS. Doctests are run once
 # below for the supported API shape rather than once per TLS backend.
-sync-test-not-ignored: sync-nativetls-test-not-ignored sync-rustlstls-test-not-ignored sync-nossl-test-not-ignored sync-fail-on-err-test
+sync-test-not-ignored: sync-nativetls-test-not-ignored sync-rustlstls-test-not-ignored sync-nossl-test-not-ignored sync-fail-on-err-test sync-compress-test-not-ignored
 sync-fail-on-err-test:
 	cargo test --lib --no-default-features --features sync,sync-native-tls,fail-on-err,aws-creds/http-credentials request_retry_
 	cargo test --lib --no-default-features --features sync,sync-native-tls,fail-on-err,aws-creds/http-credentials xml_response_embedded_error_
@@ -183,6 +191,11 @@ sync-nossl-clippy:
 sync-nossl-test: sync-nossl-test-not-ignored
 sync-nossl-test-not-ignored:
 	cargo test --tests --examples --no-default-features --features sync --features aws-creds/http-credentials
+
+# Any crate in a build can enable attohttpc's `compress`, whose decoder cannot be switched
+# off; the backend must then refuse a decoded body rather than return it.
+sync-compress-test-not-ignored:
+	cargo test --test content_encoding --no-default-features --features sync,sync-native-tls,aws-creds/http-credentials,attohttpc/compress
 
 fmt:
 	cargo fmt
