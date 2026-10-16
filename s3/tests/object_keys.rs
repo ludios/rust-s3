@@ -9,33 +9,69 @@ mod fake_s3;
 
 use fake_s3::{BUCKET, bucket, http, reply, serve, within};
 use s3::Bucket;
+use s3::bucket::CHUNK_SIZE;
 use s3::error::S3Error;
+use tokio::io::AsyncReadExt;
 
 /// The message of the error `result` failed with, if it failed.
 fn error_message<T>(result: Result<T, S3Error>) -> Option<String> {
     result.err().map(|error| error.to_string())
 }
 
-/// Asserts that deleting `key`, putting it, and presigning a GET or a DELETE of it all fail
-/// with `refusal`.
+/// Asserts that every kind of object request for `key`, sent or presigned, fails with
+/// `refusal`.
 async fn assert_refused(bucket: &Bucket, key: &str, refusal: S3Error) {
+    let tags = [("k", "v")];
+    let attempts = [
+        (
+            "head_object",
+            error_message(within(bucket.head_object(key)).await),
+        ),
+        (
+            "get_object",
+            error_message(within(bucket.get_object(key)).await),
+        ),
+        (
+            "put_object",
+            error_message(within(bucket.put_object(key, b"body")).await),
+        ),
+        (
+            "delete_object",
+            error_message(within(bucket.delete_object(key)).await),
+        ),
+        (
+            "copy_object_internal",
+            error_message(within(bucket.copy_object_internal("source", key)).await),
+        ),
+        (
+            "put_object_tagging",
+            error_message(within(bucket.put_object_tagging(key, &tags)).await),
+        ),
+        (
+            "delete_object_tagging",
+            error_message(within(bucket.delete_object_tagging(key)).await),
+        ),
+        (
+            "abort_upload",
+            error_message(within(bucket.abort_upload(key, "upload-id")).await),
+        ),
+        (
+            "presign_get",
+            error_message(within(bucket.presign_get(key, 60, None)).await),
+        ),
+        (
+            "presign_put",
+            error_message(within(bucket.presign_put(key, 60, None, None)).await),
+        ),
+        (
+            "presign_delete",
+            error_message(within(bucket.presign_delete(key, 60)).await),
+        ),
+    ];
     let refusal = Some(refusal.to_string());
-    let deleted = within(bucket.delete_object(key)).await;
-    assert_eq!(error_message(deleted), refusal, "delete_object({key:?})");
-    let put = within(bucket.put_object(key, b"body")).await;
-    assert_eq!(error_message(put), refusal, "put_object({key:?})");
-    let presigned_get = within(bucket.presign_get(key, 60, None)).await;
-    assert_eq!(
-        error_message(presigned_get),
-        refusal,
-        "presign_get({key:?})"
-    );
-    let presigned_delete = within(bucket.presign_delete(key, 60)).await;
-    assert_eq!(
-        error_message(presigned_delete),
-        refusal,
-        "presign_delete({key:?})"
-    );
+    for (method, message) in attempts {
+        assert_eq!(message, refusal, "{method}({key:?})");
+    }
 }
 
 #[tokio::test]
@@ -97,4 +133,43 @@ async fn percent_and_backslash_in_keys_are_encoded_so_no_dot_segment_appears() {
         let expected = format!("http://127.0.0.1:9000/{BUCKET}/{sent}?");
         assert!(url.starts_with(&expected), "{key:?}: {url}");
     }
+}
+
+/// The key `//` names the object `/`, which the server echoes back when the multipart upload
+/// is initiated. The parts and the completion must still address `/test-bucket//`.
+#[tokio::test]
+async fn a_streamed_upload_to_the_object_named_slash_addresses_it_throughout() {
+    let initiate = http(
+        "200 OK",
+        &[],
+        b"<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>/</Key>\
+          <UploadId>upload-id</UploadId></InitiateMultipartUploadResult>",
+    );
+    let part = http("200 OK", &[("etag", "\"part\"")], b"");
+    let complete = http("200 OK", &[], b"<CompleteMultipartUploadResult/>");
+    let (endpoint, server) = serve(vec![
+        reply(initiate),
+        reply(part.clone()),
+        reply(part),
+        reply(complete),
+    ])
+    .await;
+    let bucket = bucket(&endpoint);
+    let mut reader = tokio::io::repeat(b'x').take(CHUNK_SIZE as u64 + 1);
+
+    let response = within(bucket.put_object_stream(&mut reader, "//"))
+        .await
+        .unwrap();
+    let heads = within(server).await.unwrap();
+
+    assert_eq!(response.uploaded_bytes(), CHUNK_SIZE + 1);
+    let targets: Vec<&str> = heads
+        .iter()
+        .map(|head| head.split_whitespace().nth(1).unwrap())
+        .collect();
+    let object = format!("/{BUCKET}//?");
+    assert!(
+        targets.iter().all(|target| target.starts_with(&object)),
+        "{targets:?}"
+    );
 }

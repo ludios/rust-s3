@@ -2194,7 +2194,9 @@ impl Bucket {
         let msg = initiate_bucket
             .initiate_multipart_upload(s3_path, content_type)
             .await?;
-        let path = msg.key;
+        // Every later request names the key as the caller did, not as the server echoes it:
+        // the request path drops a leading `/`, so an echoed "/" would lose its only character.
+        let path = s3_path;
         let upload_id = &msg.upload_id;
 
         // Determine max concurrent chunks based on available memory
@@ -2221,14 +2223,13 @@ impl Bucket {
 
             let upload_part = |chunk: Vec<u8>, part_number: u32| {
                 let bucket = self.clone();
-                let path = path.clone();
                 let upload_id = upload_id.clone();
                 let content_type = content_type.to_string();
                 let part_headers = header_plan.part.clone();
                 async move {
                     let result = bucket
                         .make_multipart_request(
-                            &path,
+                            path,
                             chunk,
                             part_number,
                             &upload_id,
@@ -2285,7 +2286,7 @@ impl Bucket {
             Ok(result) => result,
             Err(error) => {
                 return self
-                    .abort_upload_after_failure(&path, upload_id, &header_plan.abort, error)
+                    .abort_upload_after_failure(path, upload_id, &header_plan.abort, error)
                     .await;
             }
         };
@@ -2305,19 +2306,19 @@ impl Bucket {
             .collect::<Vec<Part>>();
         let complete_bucket = self.with_overlaid_extra_headers(&header_plan.complete);
         let response_data = match complete_bucket
-            .complete_multipart_upload(&path, &msg.upload_id, inner_data)
+            .complete_multipart_upload(path, &msg.upload_id, inner_data)
             .await
         {
             Ok(response_data) if (200..300).contains(&response_data.status_code()) => response_data,
             Ok(response_data) => {
                 let error = response_error_from_data(response_data);
                 return self
-                    .abort_upload_after_failure(&path, upload_id, &header_plan.abort, error)
+                    .abort_upload_after_failure(path, upload_id, &header_plan.abort, error)
                     .await;
             }
             Err(error) => {
                 return self
-                    .abort_upload_after_failure(&path, upload_id, &header_plan.abort, error)
+                    .abort_upload_after_failure(path, upload_id, &header_plan.abort, error)
                     .await;
             }
         };
@@ -2336,7 +2337,9 @@ impl Bucket {
         content_type: &str,
     ) -> Result<u16, S3Error> {
         let msg = self.initiate_multipart_upload(s3_path, content_type)?;
-        let path = msg.key;
+        // Every later request names the key as the caller did, not as the server echoes it:
+        // the request path drops a leading `/`, so an echoed "/" would lose its only character.
+        let path = s3_path;
         let upload_id = &msg.upload_id;
 
         let mut needs_abort = true;
@@ -2351,13 +2354,13 @@ impl Bucket {
                         // Files is not big enough for multipart upload, going with regular put_object.
                         // The upload is already aborted, so a fallback PUT error must not abort again.
                         needs_abort = false;
-                        self.abort_upload(&path, upload_id)?;
+                        self.abort_upload(path, upload_id)?;
                         return Ok(self.put_object(s3_path, chunk.as_slice())?.status_code());
                     }
 
                     part_number += 1;
                     let response_data = self.make_multipart_request(
-                        &path,
+                        path,
                         chunk,
                         part_number,
                         upload_id,
@@ -2375,7 +2378,7 @@ impl Bucket {
                         })
                         .collect::<Vec<Part>>();
                     let response_data =
-                        self.complete_multipart_upload(&path, upload_id, inner_data)?;
+                        self.complete_multipart_upload(path, upload_id, inner_data)?;
                     if !(200..300).contains(&response_data.status_code()) {
                         return Err(response_error_from_data(response_data));
                     }
@@ -2384,7 +2387,7 @@ impl Bucket {
 
                 part_number += 1;
                 let response_data = self.make_multipart_request(
-                    &path,
+                    path,
                     chunk,
                     part_number,
                     upload_id,
@@ -2399,7 +2402,7 @@ impl Bucket {
         match upload_result {
             Ok(status_code) => Ok(status_code),
             Err(error) if needs_abort => {
-                self.abort_upload_after_failure(&path, upload_id, &HeaderMap::new(), error)
+                self.abort_upload_after_failure(path, upload_id, &HeaderMap::new(), error)
             }
             Err(error) => Err(error),
         }

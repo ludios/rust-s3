@@ -19,13 +19,13 @@ pub enum S3Error {
     InvalidListObjectsPagination(&'static str),
     #[error("header '{0}' cannot be applied to a streamed multipart upload")]
     UnsupportedMultipartHeader(http::header::HeaderName),
-    /// An object key that is empty once a leading `/` is dropped, refused before any request is
-    /// sent or URL presigned: its URL would address the bucket itself, and `delete_object("")`
-    /// would be a DeleteBucket.
+    /// An object key that is empty once a leading `/` is dropped, refused before the request is
+    /// sent to the bucket or presigned: its URL would address the bucket itself, and
+    /// `delete_object("")` would be a DeleteBucket.
     #[error("object key {0:?} names no object: its URL would address the bucket itself")]
     EmptyKey(String),
-    /// An object key with a `.` or `..` path segment, refused before any request is sent or URL
-    /// presigned: URL parsing would resolve the segment and address a different object.
+    /// An object key with a `.` or `..` path segment, refused before the request is sent to the
+    /// bucket or presigned: URL parsing would resolve the segment and address a different object.
     /// `Bucket::delete_objects`, which sends keys in the request body, can still delete one.
     #[error("object key {0:?} has a '.' or '..' segment, which a URL cannot carry unchanged")]
     DotSegmentKey(String),

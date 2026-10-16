@@ -776,38 +776,32 @@ pub trait Request {
     /// `S3Error::DotSegmentKey` for a key with a `.` or `..` segment, which URL parsing would
     /// resolve into another key, or in path style into another bucket.
     fn url(&self) -> Result<Url, S3Error> {
+        let command = self.command();
         let mut url_str = self.bucket().url();
 
-        if let Command::ListBuckets { .. } = self.command() {
+        if matches!(command, Command::ListBuckets | Command::CreateBucket { .. }) {
             return Ok(Url::parse(&url_str)?);
         }
 
-        if let Command::CreateBucket { .. } = self.command() {
-            return Ok(Url::parse(&url_str)?);
-        }
-
-        let path = if self.path().starts_with('/') {
-            self.path()[1..].to_string()
-        } else {
-            self.path()[..].to_string()
-        };
-        if path.is_empty() && self.command().addresses_object() {
-            return Err(S3Error::EmptyKey(self.path().to_string()));
+        let key = self.path();
+        let path = key.strip_prefix('/').unwrap_or(&key);
+        if path.is_empty() && command.addresses_object() {
+            return Err(S3Error::EmptyKey(key));
         }
         if path
             .split('/')
             .any(|segment| segment == "." || segment == "..")
         {
-            return Err(S3Error::DotSegmentKey(self.path().to_string()));
+            return Err(S3Error::DotSegmentKey(key));
         }
-        let encoded_path = signing::uri_encode(&path, false);
+        let encoded_path = signing::uri_encode(path, false);
 
         url_str.push('/');
         url_str.push_str(&encoded_path);
 
         // Append to url_path
         #[allow(clippy::collapsible_match)]
-        match self.command() {
+        match &command {
             Command::InitiateMultipartUpload { .. } | Command::ListMultipartUploads { .. } => {
                 url_str.push_str("?uploads")
             }
@@ -887,7 +881,7 @@ pub trait Request {
             continuation_token,
             start_after,
             max_keys,
-        } = self.command().clone()
+        } = command.clone()
         {
             let mut query_pairs = url.query_pairs_mut();
             delimiter.map(|d| query_pairs.append_pair("delimiter", &d));
@@ -910,7 +904,7 @@ pub trait Request {
             delimiter,
             marker,
             max_keys,
-        } = self.command().clone()
+        } = command.clone()
         {
             let mut query_pairs = url.query_pairs_mut();
             delimiter.map(|d| query_pairs.append_pair("delimiter", &d));
@@ -924,7 +918,7 @@ pub trait Request {
             }
         }
 
-        match self.command() {
+        match command {
             Command::ListMultipartUploads {
                 prefix,
                 delimiter,
