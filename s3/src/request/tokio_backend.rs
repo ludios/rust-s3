@@ -155,18 +155,22 @@ impl Drop for ObservedBody {
 }
 
 /// Reads `body` to its end. Unlike `Response::bytes`, a read that fails midway has already
-/// handed the observer the bytes that did arrive.
-async fn collect(mut body: ObservedBody) -> Result<Vec<u8>, S3Error> {
-    let mut bytes = Vec::new();
+/// handed the observer the bytes that did arrive. Like it, the result is allocated at its exact
+/// size, and a body that arrived as one chunk is returned without a copy.
+async fn collect(mut body: ObservedBody) -> Result<Bytes, S3Error> {
+    let mut chunks = Vec::new();
     while let Some(chunk) = body.next().await {
-        bytes.extend_from_slice(&chunk?);
+        chunks.push(chunk?);
     }
-    Ok(bytes)
+    Ok(match chunks.len() {
+        1 => chunks.swap_remove(0),
+        _ => Bytes::from(chunks.concat()),
+    })
 }
 
 /// The error `fail-on-err` reports for a non-2xx response: its status and its body, decoded
-/// lossily as `Response::text` does, retryable or not by status. A body that cannot be read
-/// yields that read's error instead, which is never retried.
+/// as UTF-8 lossily whatever its charset, retryable or not by status. A body that cannot be
+/// read yields that read's error instead, which is never retried.
 async fn http_fail_with_body(
     response: reqwest::Response,
     observer: Option<Box<dyn BodyObserver>>,
@@ -315,7 +319,7 @@ impl<'a> Request for ReqwestRequest<'a> {
                 Bytes::from("")
             }
         } else {
-            Bytes::from(collect(ObservedBody::new(response, observer)).await?)
+            collect(ObservedBody::new(response, observer)).await?
         };
         Ok(ResponseData::new(body_vec, status_code, response_headers))
     }

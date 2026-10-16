@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 //! Observation of the requests the tokio backend hands to reqwest.
 //!
@@ -47,7 +48,8 @@ pub trait BodyObserver: Send + 'static {
 
     /// Called at most once. Not called at all when the backend discards the response
     /// without reading its body (HEAD, `object_exists`, ETag-only PUTs, and the raw
-    /// response of `Request::response`).
+    /// response of `Request::response`). Under `fail-on-err` those still read a non-2xx
+    /// body into the error, a 404 from `object_exists` aside, and so do get `end`.
     fn end(self: Box<Self>, end: BodyEnd<'_>);
 }
 
