@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 
 use crate::command::HttpMethod;
-use crate::request::{Request, RequestAttemptError, ResponseData};
+use crate::request::{
+    Request, RequestAttemptError, ResponseData, expected_body_length, truncated_body_error,
+};
 
 // Temporary structure for making a request
 pub struct AttoRequest<'a> {
@@ -121,6 +123,27 @@ fn atto_response_attempt(
     }
 }
 
+/// The number of body bytes `response`, the reply to a request with `verb`, must deliver, when
+/// it announced them (see `expected_body_length`). attohttpc has validated the `Content-Length`.
+fn announced_body_length(response: &attohttpc::Response, verb: HttpMethod) -> Option<u64> {
+    let content_length = response
+        .headers()
+        .get(attohttpc::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.parse().ok());
+    expected_body_length(verb, response.status().as_u16(), content_length)
+}
+
+/// Fails with `UnexpectedEof` if a body of `received` bytes fell short of the `expected`
+/// length, if any: attohttpc ends a body cut short by its peer as if it were complete.
+fn require_body_length(expected: Option<u64>, received: u64) -> Result<(), S3Error> {
+    match expected {
+        Some(expected) if received < expected => {
+            Err(truncated_body_error(expected, received).into())
+        }
+        _ => Ok(()),
+    }
+}
+
 impl<'a> Request for AttoRequest<'a> {
     type Response = attohttpc::Response;
     type HeaderMap = attohttpc::header::HeaderMap;
@@ -198,13 +221,14 @@ impl<'a> Request for AttoRequest<'a> {
             } else {
                 Bytes::from("")
             }
+        } else if self.command.http_verb() == HttpMethod::Head {
+            // A HEAD response has no body, however large the Content-Length it announces.
+            Bytes::from("")
         } else {
-            // HEAD requests don't have a response body
-            if self.command.http_verb() == HttpMethod::Head {
-                Bytes::from("")
-            } else {
-                Bytes::from(response.bytes()?)
-            }
+            let expected = announced_body_length(&response, self.command.http_verb());
+            let body = response.bytes()?;
+            require_body_length(expected, body.len() as u64)?;
+            Bytes::from(body)
         };
         Ok(ResponseData::new(body_vec, status_code, response_headers))
     }
@@ -212,11 +236,11 @@ impl<'a> Request for AttoRequest<'a> {
     fn response_data_to_writer<T: Write + ?Sized>(&self, writer: &mut T) -> Result<u16, S3Error> {
         let mut response =
             crate::request::retry_request_sync(&self.command, || atto_response_attempt(self))?;
-
-        let status_code = response.status();
-        io::copy(&mut response, writer)?;
-
-        Ok(status_code.as_u16())
+        let status_code = response.status().as_u16();
+        let expected = announced_body_length(&response, self.command.http_verb());
+        let received = io::copy(&mut response, writer)?;
+        require_body_length(expected, received)?;
+        Ok(status_code)
     }
 
     fn response_header(&self) -> Result<(Self::HeaderMap, u16), S3Error> {
@@ -489,5 +513,72 @@ mod tests {
         assert!(signed_headers.contains("content-type"));
 
         Ok(())
+    }
+
+    /// Serves one connection on its own thread: reads the request head, writes `response`, and
+    /// closes, as a server that dies mid-body does.
+    fn serve_once(response: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_ne!(
+                    connection.read(&mut byte).unwrap(),
+                    0,
+                    "client closed early"
+                );
+                request.push(byte[0]);
+            }
+            connection.write_all(&response).unwrap();
+        });
+        endpoint
+    }
+
+    /// A 200 response announcing a 100-byte body, of which the first `sent` bytes follow.
+    fn response_of_100_bytes_sending(sent: usize) -> Vec<u8> {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".to_vec();
+        response.resize(response.len() + sent, b'x');
+        response
+    }
+
+    /// A path-style bucket at `endpoint` whose requests fail rather than hang.
+    fn local_bucket(endpoint: String) -> Box<Bucket> {
+        let region = crate::region::Region::Custom {
+            region: "test-region".to_owned(),
+            endpoint,
+        };
+        let mut bucket = Bucket::new("test-bucket", region, fake_credentials())
+            .unwrap()
+            .with_path_style();
+        bucket.set_request_timeout(Some(std::time::Duration::from_secs(5)));
+        bucket
+    }
+
+    fn is_unexpected_eof(error: &S3Error) -> bool {
+        matches!(error, S3Error::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+    }
+
+    #[test]
+    fn body_cut_short_of_its_content_length_is_an_unexpected_eof() {
+        let bucket = local_bucket(serve_once(response_of_100_bytes_sending(50)));
+        let error = bucket.get_object("/object").unwrap_err();
+        assert!(is_unexpected_eof(&error), "{error}");
+
+        let bucket = local_bucket(serve_once(response_of_100_bytes_sending(50)));
+        let mut writer = Vec::new();
+        let error = bucket
+            .get_object_to_writer("/object", &mut writer)
+            .unwrap_err();
+        assert!(is_unexpected_eof(&error), "{error}");
+        assert_eq!(writer.len(), 50, "the bytes that arrived reach the writer");
+
+        let bucket = local_bucket(serve_once(response_of_100_bytes_sending(100)));
+        assert_eq!(bucket.get_object("/object").unwrap().bytes().len(), 100);
     }
 }

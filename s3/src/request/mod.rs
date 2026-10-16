@@ -14,6 +14,8 @@ pub use request_trait::*;
 mod retry_tests;
 
 use crate::command::Command;
+#[cfg(any(feature = "with-async-std", feature = "sync"))]
+use crate::command::HttpMethod;
 use crate::error::S3Error;
 
 const RETRYABLE_HTTP_STATUSES: [u16; 6] = [408, 429, 500, 502, 503, 504];
@@ -194,6 +196,33 @@ where
             Err(error) => return Err(error.error),
         }
     }
+}
+
+/// The number of body bytes a response must deliver when it announced them: its
+/// `Content-Length`, except for the responses that carry no body whatever that header says
+/// (RFC 9112 §6.3: any response to a HEAD request, and 1xx, 204 and 304 responses). `None`
+/// leaves the end of the body to the HTTP client.
+#[cfg(any(feature = "with-async-std", feature = "sync"))]
+pub(crate) fn expected_body_length(
+    verb: HttpMethod,
+    status: u16,
+    content_length: Option<u64>,
+) -> Option<u64> {
+    match (verb, status) {
+        (HttpMethod::Head, _) | (_, 100..=199 | 204 | 304) => None,
+        _ => content_length,
+    }
+}
+
+/// The error for a body that ended after `received` of the `expected` bytes it announced.
+/// attohttpc and surf's H1 client end such a body as if it were complete, so the backends on
+/// them count the bytes themselves; hyper reports it on its own.
+#[cfg(any(feature = "with-async-std", feature = "sync"))]
+pub(crate) fn truncated_body_error(expected: u64, received: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("response body ended after {received} of the {expected} bytes it announced"),
+    )
 }
 
 #[cfg(test)]
@@ -415,5 +444,31 @@ mod retry_policy_tests {
             matches!(result, Err(S3Error::HttpFailWithBody(503, body)) if body == "do not replay")
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(all(test, any(feature = "with-async-std", feature = "sync")))]
+mod body_length_tests {
+    use super::*;
+
+    #[test]
+    fn expected_body_length_exempts_the_responses_that_never_carry_a_body() {
+        assert_eq!(
+            expected_body_length(HttpMethod::Get, 200, Some(100)),
+            Some(100)
+        );
+        assert_eq!(
+            expected_body_length(HttpMethod::Get, 500, Some(100)),
+            Some(100)
+        );
+        assert_eq!(expected_body_length(HttpMethod::Get, 200, None), None);
+        for (verb, status) in [
+            (HttpMethod::Head, 200),
+            (HttpMethod::Get, 100),
+            (HttpMethod::Get, 204),
+            (HttpMethod::Get, 304),
+        ] {
+            assert_eq!(expected_body_length(verb, status, Some(100)), None);
+        }
     }
 }
