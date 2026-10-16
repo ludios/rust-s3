@@ -30,6 +30,10 @@ pub enum S3Error {
     /// `Bucket::delete_objects`, which sends keys in the request body, can still delete one.
     #[error("object key {0:?} has a '.' or '..' segment, which a URL cannot carry unchanged")]
     DotSegmentKey(String),
+    /// A request path that URL parsing does not keep, from a bucket name or an endpoint path
+    /// with a `.` or `..` segment: refused rather than sent to whatever the parsed path names.
+    #[error("request path {built:?} cannot travel in a URL unchanged: it parses as {parsed:?}")]
+    PathRewritten { built: String, parsed: String },
     #[error("aws-creds: {0}")]
     Credentials(#[from] crate::creds::error::CredentialsError),
     #[error("aws-region: {0}")]

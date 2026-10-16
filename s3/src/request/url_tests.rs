@@ -139,19 +139,28 @@ fn commands() -> Vec<(&'static str, Command<'static>, String)> {
             object(""),
         ),
         (KEY, Command::GetObjectTorrent, object("?torrent")),
-        (KEY, Command::GetObjectTagging, object("?tagging=")),
+        (KEY, Command::GetObjectTagging, object("?tagging")),
         (
             KEY,
             Command::PutObjectTagging { tags: "<Tagging/>" },
-            object("?tagging="),
+            object("?tagging"),
         ),
-        (KEY, Command::DeleteObjectTagging, object("?tagging=")),
+        (KEY, Command::DeleteObjectTagging, object("?tagging")),
         (KEY, Command::DeleteObject, object("")),
         (KEY, Command::CopyObject { from: "/src" }, object("")),
         (KEY, put(None), object("")),
         (
             KEY,
             put(Some(Multipart::new(3, "up-id"))),
+            object("?partNumber=3&uploadId=up-id"),
+        ),
+        (
+            KEY,
+            Command::UploadPart {
+                part_number: 3,
+                content: b"x",
+                upload_id: "up-id",
+            },
             object("?partNumber=3&uploadId=up-id"),
         ),
         (
@@ -181,6 +190,14 @@ fn commands() -> Vec<(&'static str, Command<'static>, String)> {
                 version_id: Some("v1".into()),
             },
             object("?attributes&versionId=v1"),
+        ),
+        (
+            KEY,
+            Command::GetObjectAttributes {
+                expected_bucket_owner: "owner".into(),
+                version_id: None,
+            },
+            object("?attributes"),
         ),
         (
             "",
@@ -224,6 +241,7 @@ fn commands() -> Vec<(&'static str, Command<'static>, String)> {
             "/test-bucket".to_owned(),
         ),
         ("", Command::DeleteBucket, bucket("")),
+        ("", Command::GetBucketLocation, bucket("?location")),
         (
             "",
             Command::GetBucketCors {
@@ -348,13 +366,70 @@ fn every_command_is_sent_to_its_pinned_url_and_host() {
 }
 
 #[test]
-fn list_buckets_is_sent_to_the_service_root() {
-    let bucket = *Bucket::new("", custom("http://localhost:9000"), credentials(None))
-        .unwrap()
-        .with_path_style();
-    let (url, host) = run!(sent(&bucket, "", Command::ListBuckets)).unwrap();
-    assert_eq!(url.as_str(), "http://localhost:9000/");
-    assert_eq!(host, "localhost:9000");
+fn list_buckets_is_sent_to_the_service_root_whichever_bucket_asks() {
+    let cases = [
+        (
+            *Bucket::new("", custom("http://localhost:9000"), credentials(None))
+                .unwrap()
+                .with_path_style(),
+            "http://localhost:9000/",
+            "localhost:9000",
+        ),
+        // `Bucket::exists` asks through a subdomain-style bucket, whose own host names it.
+        (
+            *Bucket::new("test-bucket", Region::UsEast1, credentials(None)).unwrap(),
+            "https://s3.amazonaws.com/",
+            "s3.amazonaws.com",
+        ),
+        (
+            path_style("https://project.example:8443/storage/v1/s3"),
+            "https://project.example:8443/storage/v1/s3",
+            "project.example:8443",
+        ),
+    ];
+    for (bucket, expected_url, expected_host) in cases {
+        let (url, host) = run!(sent(&bucket, "", Command::ListBuckets)).unwrap();
+        assert_eq!(url.as_str(), expected_url);
+        assert_eq!(host, expected_host);
+    }
+}
+
+#[test]
+fn reserved_characters_in_ids_are_percent_encoded_and_round_trip() {
+    let bucket = path_style("http://localhost:9000");
+    let id = "a+b/c=d&e?f g";
+    let encoded = "a%2Bb%2Fc%3Dd%26e%3Ff%20g";
+    let cases = [
+        (
+            Command::AbortMultipartUpload { upload_id: id },
+            format!("?uploadId={encoded}"),
+        ),
+        (
+            Command::PutObject {
+                content: b"x",
+                content_type: "text/plain",
+                custom_headers: None,
+                multipart: Some(Multipart::new(1, id)),
+            },
+            format!("?partNumber=1&uploadId={encoded}"),
+        ),
+        (
+            Command::GetObjectAttributes {
+                expected_bucket_owner: "owner".into(),
+                version_id: Some(id.into()),
+            },
+            format!("?attributes&versionId={encoded}"),
+        ),
+    ];
+    for (command, query) in cases {
+        let (url, _) = run!(sent(&bucket, KEY, command)).unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!("http://localhost:9000/test-bucket/{ENCODED_KEY}{query}")
+        );
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        assert_eq!(pairs.last().unwrap().1, id);
+    }
 }
 
 #[test]
@@ -554,20 +629,43 @@ fn presign_put_signs_its_custom_headers_and_queries() {
         run!(bucket.presign_put(KEY, 60, Some(headers.clone()), Some(queries))).unwrap();
     let pairs = query_of(&presigned);
     assert_eq!(pairs[4].1, "content-type;host");
-    // The sync backend signs the custom queries but leaves them out of the URL.
-    #[cfg(not(feature = "sync"))]
-    {
-        assert_eq!(
-            names(&pairs),
-            [AUTH_KEYS.as_slice(), &["x-id", "X-Amz-Signature"]].concat()
-        );
-        assert!(signature_verifies(
-            &presigned,
-            "PUT",
-            "localhost:9000",
-            &headers
-        ));
-    }
+    assert_eq!(
+        names(&pairs),
+        [AUTH_KEYS.as_slice(), &["x-id", "X-Amz-Signature"]].concat()
+    );
+    assert!(signature_verifies(
+        &presigned,
+        "PUT",
+        "localhost:9000",
+        &headers
+    ));
+}
+
+#[test]
+fn presign_with_extra_query_has_one_query_string_signed_whole() {
+    let mut bucket = path_style("http://localhost:9000");
+    bucket.add_query("x-id", "GetObject");
+    let queries = HashMap::from([("acl".to_owned(), String::new())]);
+    let presigned = run!(bucket.presign_get(KEY, 60, Some(queries))).unwrap();
+    assert_eq!(presigned.matches('?').count(), 1, "{presigned}");
+    assert!(presigned.contains("&acl&X-Amz-Signature="), "{presigned}");
+    let pairs = query_of(&presigned);
+    assert_eq!(
+        names(&pairs),
+        [
+            &["x-id"][..],
+            &AUTH_KEYS[..],
+            &["acl", "X-Amz-Signature"][..]
+        ]
+        .concat()
+    );
+    assert_eq!(pairs[0].1, "GetObject");
+    assert!(signature_verifies(
+        &presigned,
+        "GET",
+        "localhost:9000",
+        &HeaderMap::new()
+    ));
 }
 
 #[test]
@@ -628,6 +726,11 @@ fn presigned_urls_keep_the_endpoints_authority_verbatim() {
             "minio:443",
         ),
         (
+            "https://minio:443/storage/v1/s3",
+            "https://minio:443/storage/v1/s3/test-bucket/",
+            "minio:443",
+        ),
+        (
             "http://minio:9000",
             "http://minio:9000/test-bucket/",
             "minio:9000",
@@ -677,12 +780,17 @@ proptest! {
         let bucket = path_style("http://localhost:9000");
         let stripped = key.strip_prefix('/').unwrap_or(&key);
         match run!(sent(&bucket, &key, Command::GetObject)) {
+            Err(S3Error::EmptyKey(refused)) => {
+                prop_assert!(stripped.is_empty(), "{key:?} refused as empty");
+                prop_assert_eq!(refused, key);
+            }
             Err(S3Error::DotSegmentKey(refused)) => {
                 prop_assert!(has_dot_segment(stripped), "{key:?} refused");
                 prop_assert_eq!(refused, key);
             }
             Err(error) => prop_assert!(false, "{key:?}: {error}"),
             Ok((url, _)) => {
+                prop_assert!(!stripped.is_empty(), "{key:?} sent");
                 prop_assert!(!has_dot_segment(stripped), "{key:?} sent");
                 prop_assert_eq!(url.path(), format!("/test-bucket/{}", signing::uri_encode(stripped, false)));
                 let decoded = percent_encoding::percent_decode_str(url.path()).decode_utf8().unwrap();
@@ -729,21 +837,36 @@ proptest! {
     #[test]
     fn any_presigned_get_verifies_from_its_own_url(
         key in any_key(),
+        extra in any_queries(),
         custom in any_queries(),
         expiry in 1..=604800u32,
     ) {
         let stripped = key.strip_prefix('/').unwrap_or(&key);
-        prop_assume!(!has_dot_segment(stripped));
-        let bucket = path_style("http://localhost:9000");
+        prop_assume!(!stripped.is_empty() && !has_dot_segment(stripped));
+        let mut bucket = path_style("http://localhost:9000");
+        for (name, value) in &extra {
+            bucket.add_query(name, value);
+        }
         let presigned = run!(bucket.presign_get(&key, expiry, Some(custom.clone()))).unwrap();
         let url = Url::parse(&presigned).unwrap();
         prop_assert_eq!(url.path(), format!("/test-bucket/{}", signing::uri_encode(stripped, false)));
         let pairs = query_of(&presigned);
-        prop_assert_eq!(&names(&pairs)[..5], AUTH_KEYS.as_slice());
-        prop_assert_eq!(&pairs[3].1, &expiry.to_string());
-        for (name, value) in &custom {
+        let auth = extra.len()..extra.len() + AUTH_KEYS.len();
+        prop_assert_eq!(&names(&pairs)[auth.clone()], AUTH_KEYS.as_slice());
+        prop_assert_eq!(&pairs[auth.start + 3].1, &expiry.to_string());
+        for (name, value) in extra.iter().chain(&custom) {
             prop_assert!(pairs.contains(&(name.clone(), value.clone())), "{name}={value} in {presigned}");
         }
         prop_assert!(signature_verifies(&presigned, "GET", "localhost:9000", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn any_upload_id_round_trips_through_the_query(upload_id in "[ -~]{1,16}") {
+        let bucket = path_style("http://localhost:9000");
+        let command = Command::AbortMultipartUpload { upload_id: &upload_id };
+        let (url, _) = run!(sent(&bucket, KEY, command)).unwrap();
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        prop_assert_eq!(pairs, vec![("uploadId".to_owned(), upload_id.clone())]);
+        prop_assert_eq!(url.path(), format!("/test-bucket/{ENCODED_KEY}"));
     }
 }

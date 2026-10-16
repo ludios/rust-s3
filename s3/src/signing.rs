@@ -25,11 +25,8 @@
 //!
 //! - **authorization_header**: Generates the Authorization header value, which includes the credential scope, signed headers, and the request signature. This header must be included in the signed AWS requests.
 //!
-//! - **authorization_query_params_no_sig**: Constructs query parameters for presigned URLs, excluding the final signature. This is used when creating presigned URLs for temporary access to S3 objects.
-//!
-//! - **flatten_queries**: Flattens a map of query parameters into a single query string, ensuring proper encoding.
+//! - **authorization_query_params_no_sig**: The query parameters of a presigned URL, all but the final signature, as pairs for the request URL builder to encode.
 
-use std::collections::HashMap;
 use std::str;
 
 use hmac::{Hmac, Mac};
@@ -42,8 +39,6 @@ use url::Url;
 use crate::LONG_DATETIME;
 use crate::error::S3Error;
 use crate::region::Region;
-
-use std::fmt::Write as _;
 
 const SHORT_DATE: &[time::format_description::FormatItem<'static>] =
     format_description!("[year][month][day]");
@@ -225,69 +220,36 @@ pub fn authorization_header(
     ))
 }
 
+/// The query parameters of a presigned URL, all but the signature, as the AWS documentation
+/// orders them: `custom_headers` are the headers the client must send as signed, besides
+/// `Host`; `token` is the security token to carry.
 pub fn authorization_query_params_no_sig(
     access_key: &str,
     datetime: &OffsetDateTime,
     region: &Region,
     expires: u32,
     custom_headers: Option<&HeaderMap>,
-    token: Option<&String>,
-) -> Result<String, S3Error> {
-    let credentials = format!("{}/{}", access_key, scope_string(datetime, region)?);
-    let credentials = utf8_percent_encode(&credentials, FRAGMENT_SLASH);
-
+    token: Option<&str>,
+) -> Result<Vec<(String, String)>, S3Error> {
     let mut signed_headers = vec!["host".to_string()];
-
-    if let Some(custom_headers) = &custom_headers {
-        for k in custom_headers.keys() {
-            signed_headers.push(k.to_string())
-        }
+    if let Some(custom_headers) = custom_headers {
+        signed_headers.extend(custom_headers.keys().map(|name| name.to_string()));
     }
-
     signed_headers.sort();
-    let signed_headers = signed_headers.join(";");
-    let signed_headers = utf8_percent_encode(&signed_headers, FRAGMENT_SLASH);
-
-    let mut query_params = format!(
-        "?X-Amz-Algorithm=AWS4-HMAC-SHA256\
-            &X-Amz-Credential={credentials}\
-            &X-Amz-Date={long_date}\
-            &X-Amz-Expires={expires}\
-            &X-Amz-SignedHeaders={signed_headers}",
-        credentials = credentials,
-        long_date = datetime.format(LONG_DATETIME)?,
-        expires = expires,
-        signed_headers = signed_headers,
-    );
-
+    let mut params = vec![
+        ("X-Amz-Algorithm".to_owned(), "AWS4-HMAC-SHA256".to_owned()),
+        (
+            "X-Amz-Credential".to_owned(),
+            format!("{access_key}/{}", scope_string(datetime, region)?),
+        ),
+        ("X-Amz-Date".to_owned(), datetime.format(LONG_DATETIME)?),
+        ("X-Amz-Expires".to_owned(), expires.to_string()),
+        ("X-Amz-SignedHeaders".to_owned(), signed_headers.join(";")),
+    ];
     if let Some(token) = token {
-        write!(
-            query_params,
-            "&X-Amz-Security-Token={}",
-            utf8_percent_encode(token, FRAGMENT_SLASH)
-        )
-        .expect("Could not write token");
+        params.push(("X-Amz-Security-Token".to_owned(), token.to_owned()));
     }
-
-    Ok(query_params)
-}
-
-pub fn flatten_queries(queries: Option<&HashMap<String, String>>) -> Result<String, S3Error> {
-    match queries {
-        None => Ok(String::new()),
-        Some(queries) => {
-            let mut query_str = String::new();
-            for (k, v) in queries {
-                write!(
-                    query_str,
-                    "&{}={}",
-                    utf8_percent_encode(k, FRAGMENT_SLASH),
-                    utf8_percent_encode(v, FRAGMENT_SLASH),
-                )?;
-            }
-            Ok(query_str)
-        }
-    }
+    Ok(params)
 }
 
 #[cfg(test)]

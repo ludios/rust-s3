@@ -12,7 +12,7 @@
 //!
 //! - **Multipart Struct**
 //!   - Represents a part of a multipart upload, containing the part number and the associated upload ID.
-//!   - Provides methods for constructing a new multipart part and generating a query string for the S3 API.
+//!   - Names the part for the request URL builder, which puts both into the query.
 //!
 //! - **Command Enum**
 //!   - The core of this module, encapsulating various S3 operations, such as:
@@ -60,18 +60,11 @@ use http::HeaderMap;
 
 #[derive(Clone, Debug)]
 pub struct Multipart<'a> {
-    part_number: u32,
-    upload_id: &'a str,
+    pub(crate) part_number: u32,
+    pub(crate) upload_id: &'a str,
 }
 
 impl<'a> Multipart<'a> {
-    pub fn query_string(&self) -> String {
-        format!(
-            "?partNumber={}&uploadId={}",
-            self.part_number, self.upload_id
-        )
-    }
-
     pub fn new(part_number: u32, upload_id: &'a str) -> Self {
         Multipart {
             part_number,

@@ -2547,7 +2547,7 @@ impl Bucket {
     /// ```
     #[maybe_async::maybe_async]
     pub async fn location(&self) -> Result<(Region, u16), S3Error> {
-        let request = RequestImpl::new(self, "?location", Command::GetBucketLocation).await?;
+        let request = RequestImpl::new(self, "", Command::GetBucketLocation).await?;
         let response_data = request.response_data(false).await?;
         let region_string = String::from_utf8_lossy(response_data.as_slice());
         let region = match quick_xml::de::from_reader(region_string.as_bytes()) {

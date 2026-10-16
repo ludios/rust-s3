@@ -17,14 +17,15 @@ use url::Url;
 use crate::LONG_DATETIME;
 use crate::bucket::Bucket;
 use crate::command::Command;
+use crate::creds::error::CredentialsError;
 use crate::error::S3Error;
+use crate::request::request_url::RequestUrl;
 use crate::signing;
 use bytes::Bytes;
 use http::HeaderMap;
 use http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, DATE, HOST, HeaderName, RANGE,
 };
-use std::fmt::Write as _;
 
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 use futures_util::Stream;
@@ -456,18 +457,9 @@ impl async_std::io::Read for ResponseDataStream {
     }
 }
 
-/// The authority of an endpoint host, dropping any path that follows it.
-///
-/// A custom endpoint may carry a path, as Supabase Storage's
-/// `https://<project>.supabase.co/storage/v1/s3` does, and `Region::host`
-/// keeps it so that `Bucket::url` can place the bucket and key underneath.
-/// RFC 9110 §7.2 defines `Host` as `uri-host [ ":" port ]`, so that path
-/// cannot travel in the header.
-fn authority_of(host: &str) -> &str {
-    match host.find('/') {
-        Some(position) => &host[..position],
-        None => host,
-    }
+/// Where `request` goes, from its bucket, path, and command.
+fn request_url<R: Request + ?Sized>(request: &R) -> Result<RequestUrl, S3Error> {
+    RequestUrl::new(&request.bucket(), &request.path(), &request.command())
 }
 
 #[maybe_async::maybe_async]
@@ -556,400 +548,68 @@ pub trait Request {
         signing::string_to_sign(&self.datetime(), &self.bucket().region(), request)
     }
 
-    fn host_header(&self) -> String {
-        authority_of(&self.bucket().host()).to_string()
-    }
-
-    #[maybe_async::async_impl]
-    async fn presigned(&self) -> Result<String, S3Error> {
-        let (expiry, custom_headers, custom_queries) = match self.command() {
-            Command::PresignGet {
-                expiry_secs,
-                custom_queries,
-            } => (expiry_secs, None, custom_queries),
-            Command::PresignPut {
-                expiry_secs,
-                custom_headers,
-                custom_queries,
-            } => (expiry_secs, custom_headers, custom_queries),
-            Command::PresignDelete { expiry_secs } => (expiry_secs, None, None),
-            _ => unreachable!(),
-        };
-
-        let url = self
-            .presigned_url_no_sig(expiry, custom_headers.as_ref(), custom_queries.as_ref())
-            .await?;
-
-        // Build the URL string preserving the original host (including standard ports)
-        // The Url type drops standard ports when converting to string, but we need them
-        // for signature validation
-        let url_str = if let awsregion::Region::Custom { ref endpoint, .. } = self.bucket().region()
-        {
-            // Check if we need to preserve a standard port
-            if (endpoint.contains(":80") && url.scheme() == "http" && url.port().is_none())
-                || (endpoint.contains(":443") && url.scheme() == "https" && url.port().is_none())
-            {
-                // Rebuild the URL with the original host from the endpoint
-                let host = self.bucket().host();
-                format!(
-                    "{}://{}{}{}",
-                    url.scheme(),
-                    host,
-                    url.path(),
-                    url.query().map(|q| format!("?{}", q)).unwrap_or_default()
-                )
-            } else {
-                url.to_string()
-            }
-        } else {
-            url.to_string()
-        };
-
-        Ok(format!(
-            "{}&X-Amz-Signature={}",
-            url_str,
-            self.presigned_authorization(custom_headers.as_ref())
-                .await?
-        ))
-    }
-
-    #[maybe_async::sync_impl]
-    async fn presigned(&self) -> Result<String, S3Error> {
-        let (expiry, custom_headers, custom_queries) = match self.command() {
-            Command::PresignGet {
-                expiry_secs,
-                custom_queries,
-            } => (expiry_secs, None, custom_queries),
-            Command::PresignPut {
-                expiry_secs,
-                custom_headers,
-                ..
-            } => (expiry_secs, custom_headers, None),
-            Command::PresignDelete { expiry_secs } => (expiry_secs, None, None),
-            _ => unreachable!(),
-        };
-
-        let url =
-            self.presigned_url_no_sig(expiry, custom_headers.as_ref(), custom_queries.as_ref())?;
-
-        // Build the URL string preserving the original host (including standard ports)
-        // The Url type drops standard ports when converting to string, but we need them
-        // for signature validation
-        let url_str = if let awsregion::Region::Custom { ref endpoint, .. } = self.bucket().region()
-        {
-            // Check if we need to preserve a standard port
-            if (endpoint.contains(":80") && url.scheme() == "http" && url.port().is_none())
-                || (endpoint.contains(":443") && url.scheme() == "https" && url.port().is_none())
-            {
-                // Rebuild the URL with the original host from the endpoint
-                let host = self.bucket().host();
-                format!(
-                    "{}://{}{}{}",
-                    url.scheme(),
-                    host,
-                    url.path(),
-                    url.query().map(|q| format!("?{}", q)).unwrap_or_default()
-                )
-            } else {
-                url.to_string()
-            }
-        } else {
-            url.to_string()
-        };
-
-        Ok(format!(
-            "{}&X-Amz-Signature={}",
-            url_str,
-            self.presigned_authorization(custom_headers.as_ref())?
-        ))
-    }
-
-    async fn presigned_authorization(
-        &self,
-        custom_headers: Option<&HeaderMap>,
-    ) -> Result<String, S3Error> {
-        let mut headers = HeaderMap::new();
-        let host_header = self.host_header();
-        headers.insert(HOST, host_header.parse()?);
-        if let Some(custom_headers) = custom_headers {
-            for (k, v) in custom_headers.iter() {
-                headers.insert(k.clone(), v.clone());
-            }
-        }
-        let canonical_request = self.presigned_canonical_request(&headers).await?;
-        let string_to_sign = self.string_to_sign(&canonical_request)?;
-        let mut hmac = signing::HmacSha256::new_from_slice(&self.signing_key().await?)?;
-        hmac.update(string_to_sign.as_bytes());
-        let signature = hex::encode(hmac.finalize().into_bytes());
-        // let signed_header = signing::signed_header_string(&headers);
-        Ok(signature)
-    }
-
-    async fn presigned_canonical_request(&self, headers: &HeaderMap) -> Result<String, S3Error> {
-        let (expiry, custom_headers, custom_queries) = match self.command() {
-            Command::PresignGet {
-                expiry_secs,
-                custom_queries,
-            } => (expiry_secs, None, custom_queries),
-            Command::PresignPut {
-                expiry_secs,
-                custom_headers,
-                custom_queries,
-            } => (expiry_secs, custom_headers, custom_queries),
-            Command::PresignDelete { expiry_secs } => (expiry_secs, None, None),
-            _ => unreachable!(),
-        };
-
-        signing::canonical_request(
-            &self.command().http_verb().to_string(),
-            &self
-                .presigned_url_no_sig(expiry, custom_headers.as_ref(), custom_queries.as_ref())
-                .await?,
-            headers,
-            "UNSIGNED-PAYLOAD",
-        )
-    }
-
-    #[maybe_async::async_impl]
-    async fn presigned_url_no_sig(
-        &self,
-        expiry: u32,
-        custom_headers: Option<&HeaderMap>,
-        custom_queries: Option<&HashMap<String, String>>,
-    ) -> Result<Url, S3Error> {
-        let bucket = self.bucket();
-        let token = if let Some(security_token) = bucket.security_token().await? {
-            Some(security_token)
-        } else {
-            bucket.session_token().await?
-        };
-        let url = Url::parse(&format!(
-            "{}{}{}",
-            self.url()?,
-            signing::authorization_query_params_no_sig(
-                &self.bucket().access_key().await?.unwrap_or_default(),
-                &self.datetime(),
-                &self.bucket().region(),
-                expiry,
-                custom_headers,
-                token.as_ref()
-            )?,
-            signing::flatten_queries(custom_queries)?,
-        ))?;
-
-        Ok(url)
-    }
-
-    #[maybe_async::sync_impl]
-    fn presigned_url_no_sig(
-        &self,
-        expiry: u32,
-        custom_headers: Option<&HeaderMap>,
-        custom_queries: Option<&HashMap<String, String>>,
-    ) -> Result<Url, S3Error> {
-        let bucket = self.bucket();
-        let token = if let Some(security_token) = bucket.security_token()? {
-            Some(security_token)
-        } else {
-            bucket.session_token()?
-        };
-        let url = Url::parse(&format!(
-            "{}{}{}",
-            self.url()?,
-            signing::authorization_query_params_no_sig(
-                &self.bucket().access_key()?.unwrap_or_default(),
-                &self.datetime(),
-                &self.bucket().region(),
-                expiry,
-                custom_headers,
-                token.as_ref()
-            )?,
-            signing::flatten_queries(custom_queries)?,
-        ))?;
-
-        Ok(url)
-    }
-
-    /// The URL this request is sent to, or presigned for: the bucket's URL, then the object key
-    /// percent-encoded, then the command's query. Fails with `S3Error::EmptyKey` for an object
-    /// command whose key is empty, which would address the bucket itself, and with
-    /// `S3Error::DotSegmentKey` for a key with a `.` or `..` segment, which URL parsing would
-    /// resolve into another key, or in path style into another bucket.
+    /// The URL this request is sent to. Fails with `S3Error::EmptyKey` for an object command
+    /// without a key, and with `S3Error::DotSegmentKey` for a key with a `.` or `..` segment,
+    /// which URL parsing would resolve into another key, or in path style into another bucket.
     fn url(&self) -> Result<Url, S3Error> {
-        let command = self.command();
-        let mut url_str = self.bucket().url();
+        request_url(self)?.to_url()
+    }
 
-        if matches!(command, Command::ListBuckets | Command::CreateBucket { .. }) {
-            return Ok(Url::parse(&url_str)?);
+    /// The presigned URL of a `PresignGet`, `PresignPut`, or `PresignDelete`: the request's
+    /// URL, then the signing parameters, the caller's queries, and last the signature over all
+    /// of it, the `Host` header, and for a PUT the caller's headers.
+    #[maybe_async::maybe_async]
+    async fn presigned(&self) -> Result<String, S3Error> {
+        let (expiry, custom_headers, custom_queries) = match self.command() {
+            Command::PresignGet {
+                expiry_secs,
+                custom_queries,
+            } => (expiry_secs, None, custom_queries),
+            Command::PresignPut {
+                expiry_secs,
+                custom_headers,
+                custom_queries,
+            } => (expiry_secs, custom_headers, custom_queries),
+            Command::PresignDelete { expiry_secs } => (expiry_secs, None, None),
+            _ => unreachable!(),
+        };
+        let bucket = self.bucket();
+        let credentials = bucket.credentials().await?;
+        let secret_key = credentials.secret_key.ok_or(S3Error::Credentials(
+            CredentialsError::ConfigMissingSecretKey,
+        ))?;
+        let token = credentials.security_token.or(credentials.session_token);
+        let mut url = request_url(self)?;
+        url.query.extend(signing::authorization_query_params_no_sig(
+            credentials.access_key.as_deref().unwrap_or_default(),
+            &self.datetime(),
+            &bucket.region(),
+            expiry,
+            custom_headers.as_ref(),
+            token.as_deref(),
+        )?);
+        url.query.extend(custom_queries.into_iter().flatten());
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, url.authority.parse()?);
+        for (name, value) in custom_headers.iter().flatten() {
+            headers.insert(name.clone(), value.clone());
         }
-
-        let key = self.path();
-        let path = key.strip_prefix('/').unwrap_or(&key);
-        if path.is_empty() && command.addresses_object() {
-            return Err(S3Error::EmptyKey(key));
-        }
-        if path
-            .split('/')
-            .any(|segment| segment == "." || segment == "..")
-        {
-            return Err(S3Error::DotSegmentKey(key));
-        }
-        let encoded_path = signing::uri_encode(path, false);
-
-        url_str.push('/');
-        url_str.push_str(&encoded_path);
-
-        // Append to url_path
-        #[allow(clippy::collapsible_match)]
-        match &command {
-            Command::InitiateMultipartUpload { .. } | Command::ListMultipartUploads { .. } => {
-                url_str.push_str("?uploads")
-            }
-            Command::AbortMultipartUpload { upload_id } => {
-                write!(url_str, "?uploadId={}", upload_id).expect("Could not write to url_str");
-            }
-            Command::CompleteMultipartUpload { upload_id, .. } => {
-                write!(url_str, "?uploadId={}", upload_id).expect("Could not write to url_str");
-            }
-            Command::GetObjectTorrent => url_str.push_str("?torrent"),
-            Command::PutObject { multipart, .. } => {
-                if let Some(multipart) = multipart {
-                    url_str.push_str(&multipart.query_string())
-                }
-            }
-            Command::GetBucketLifecycle
-            | Command::PutBucketLifecycle { .. }
-            | Command::DeleteBucketLifecycle => {
-                url_str.push_str("?lifecycle");
-            }
-            Command::GetBucketCors { .. }
-            | Command::PutBucketCors { .. }
-            | Command::DeleteBucketCors { .. } => {
-                url_str.push_str("?cors");
-            }
-            Command::GetBucketPolicy
-            | Command::PutBucketPolicy { .. }
-            | Command::DeleteBucketPolicy => {
-                url_str.push_str("?policy");
-            }
-            Command::GetObjectAttributes { version_id, .. } => {
-                if let Some(version_id) = version_id {
-                    url_str.push_str(&format!("?attributes&versionId={}", version_id));
-                } else {
-                    url_str.push_str("?attributes&versionId=null");
-                }
-            }
-            Command::HeadObject => {}
-            Command::DeleteObject => {}
-            Command::DeleteObjectTagging => {}
-            Command::GetObject => {}
-            Command::GetObjectRange { .. } => {}
-            Command::GetObjectTagging => {}
-            Command::ListObjects { .. } => {}
-            Command::ListObjectsV2 { .. } => {}
-            Command::GetBucketLocation => {}
-            Command::PresignGet { .. } => {}
-            Command::PresignPut { .. } => {}
-            Command::PresignDelete { .. } => {}
-            Command::DeleteBucket => {}
-            Command::ListBuckets => {}
-            Command::CopyObject { .. } => {}
-            Command::PutObjectTagging { .. } => {}
-            Command::UploadPart { .. } => {}
-            Command::CreateBucket { .. } => {}
-            Command::DeleteObjects { .. } => {
-                url_str.push_str("?delete");
-            }
-        }
-
-        let mut url = Url::parse(&url_str)?;
-        // With dot segments refused and every other character URL parsing could rewrite
-        // percent-encoded, the path keeps the key exactly as encoded.
-        debug_assert!(
-            url.path().ends_with(&format!("/{encoded_path}")),
-            "URL parsing rewrote the path of {url_str:?} to {:?}",
-            url.path()
-        );
-
-        for (key, value) in &self.bucket().extra_query {
-            url.query_pairs_mut().append_pair(key, value);
-        }
-
-        if let Command::ListObjectsV2 {
-            prefix,
-            delimiter,
-            continuation_token,
-            start_after,
-            max_keys,
-        } = command.clone()
-        {
-            let mut query_pairs = url.query_pairs_mut();
-            delimiter.map(|d| query_pairs.append_pair("delimiter", &d));
-
-            query_pairs.append_pair("prefix", &prefix);
-            query_pairs.append_pair("list-type", "2");
-            if let Some(token) = continuation_token {
-                query_pairs.append_pair("continuation-token", &token);
-            }
-            if let Some(start_after) = start_after {
-                query_pairs.append_pair("start-after", &start_after);
-            }
-            if let Some(max_keys) = max_keys {
-                query_pairs.append_pair("max-keys", &max_keys.to_string());
-            }
-        }
-
-        if let Command::ListObjects {
-            prefix,
-            delimiter,
-            marker,
-            max_keys,
-        } = command.clone()
-        {
-            let mut query_pairs = url.query_pairs_mut();
-            delimiter.map(|d| query_pairs.append_pair("delimiter", &d));
-
-            query_pairs.append_pair("prefix", &prefix);
-            if let Some(marker) = marker {
-                query_pairs.append_pair("marker", &marker);
-            }
-            if let Some(max_keys) = max_keys {
-                query_pairs.append_pair("max-keys", &max_keys.to_string());
-            }
-        }
-
-        match command {
-            Command::ListMultipartUploads {
-                prefix,
-                delimiter,
-                key_marker,
-                upload_id_marker,
-                max_uploads,
-            } => {
-                let mut query_pairs = url.query_pairs_mut();
-                delimiter.map(|d| query_pairs.append_pair("delimiter", d));
-                if let Some(prefix) = prefix {
-                    query_pairs.append_pair("prefix", prefix);
-                }
-                if let Some(key_marker) = key_marker {
-                    query_pairs.append_pair("key-marker", &key_marker);
-                }
-                if let Some(upload_id_marker) = upload_id_marker {
-                    query_pairs.append_pair("upload-id-marker", &upload_id_marker);
-                }
-                if let Some(max_uploads) = max_uploads {
-                    query_pairs.append_pair("max-uploads", max_uploads.to_string().as_str());
-                }
-            }
-            Command::PutObjectTagging { .. }
-            | Command::GetObjectTagging
-            | Command::DeleteObjectTagging => {
-                url.query_pairs_mut().append_pair("tagging", "");
-            }
-            _ => {}
-        }
-
-        Ok(url)
+        let canonical_request = signing::canonical_request(
+            &self.command().http_verb().to_string(),
+            &url.to_url()?,
+            &headers,
+            "UNSIGNED-PAYLOAD",
+        )?;
+        let string_to_sign = self.string_to_sign(&canonical_request)?;
+        let signing_key =
+            signing::signing_key(&self.datetime(), &secret_key, &bucket.region(), "s3")?;
+        let mut hmac = signing::HmacSha256::new_from_slice(&signing_key)?;
+        hmac.update(string_to_sign.as_bytes());
+        url.query.push((
+            "X-Amz-Signature".to_owned(),
+            hex::encode(hmac.finalize().into_bytes()),
+        ));
+        Ok(url.to_string())
     }
 
     fn canonical_request(&self, headers: &HeaderMap) -> Result<String, S3Error> {
@@ -1017,9 +677,7 @@ pub trait Request {
             }
         }
 
-        let host_header = self.host_header();
-
-        headers.insert(HOST, host_header.parse()?);
+        headers.insert(HOST, request_url(self)?.authority.parse()?);
 
         if let Command::CopyObject { from } = self.command() {
             headers.insert(HeaderName::from_static("x-amz-copy-source"), from.parse()?);
@@ -1165,27 +823,6 @@ mod tests {
     use bytes::Bytes;
     use futures_util::stream;
     use tokio::io::AsyncReadExt;
-
-    #[test]
-    fn test_authority_of_keeps_a_plain_host() {
-        assert_eq!(
-            authority_of("s3.eu-central-1.amazonaws.com"),
-            "s3.eu-central-1.amazonaws.com"
-        );
-        assert_eq!(authority_of("127.0.0.1:9000"), "127.0.0.1:9000");
-    }
-
-    #[test]
-    fn test_authority_of_drops_an_endpoint_path() {
-        assert_eq!(
-            authority_of("project.supabase.co/storage/v1/s3"),
-            "project.supabase.co"
-        );
-        assert_eq!(
-            authority_of("127.0.0.1:54321/storage/v1/s3"),
-            "127.0.0.1:54321"
-        );
-    }
 
     #[tokio::test]
     async fn test_async_read_implementation() {

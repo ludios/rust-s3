@@ -5,6 +5,7 @@ pub mod async_std_backend;
 #[cfg(feature = "sync")]
 pub mod blocking;
 pub mod request_trait;
+pub(crate) mod request_url;
 #[cfg(feature = "with-tokio")]
 pub mod tokio_backend;
 
