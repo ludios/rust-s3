@@ -24,8 +24,9 @@ pub(crate) struct RequestUrl {
     /// The absolute path, percent-encoded: the endpoint's own path, `/bucket` in path style,
     /// then `/key`.
     pub(crate) path: String,
-    /// The query as names and values, decoded, in the order sent.
-    pub(crate) query: Vec<(String, String)>,
+    /// The query as names and values, decoded, in the order sent; a flag such as `uploads`
+    /// has no value, a parameter keeps an empty one.
+    pub(crate) query: Vec<(String, Option<String>)>,
 }
 
 /// `host`, as `Region::host` gives it, split into its authority and the path that may follow:
@@ -43,19 +44,19 @@ fn has_dot_segment(key: &str) -> bool {
 }
 
 /// The query that addresses part `part_number` of multipart upload `upload_id`.
-fn part_query(part_number: u32, upload_id: &str) -> Vec<(String, String)> {
+fn part_query(part_number: u32, upload_id: &str) -> Vec<(String, Option<String>)> {
     vec![
-        ("partNumber".to_owned(), part_number.to_string()),
-        ("uploadId".to_owned(), upload_id.to_owned()),
+        ("partNumber".to_owned(), Some(part_number.to_string())),
+        ("uploadId".to_owned(), Some(upload_id.to_owned())),
     ]
 }
 
 /// The query `command` carries: its subresource, then its parameters in the order the S3
 /// documentation lists them.
-fn command_query(command: &Command<'_>) -> Vec<(String, String)> {
-    let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
-    let flag = |name: &str| pair(name, "");
-    let optional = |query: &mut Vec<(String, String)>, name: &str, value: Option<&str>| {
+fn command_query(command: &Command<'_>) -> Vec<(String, Option<String>)> {
+    let pair = |name: &str, value: &str| (name.to_owned(), Some(value.to_owned()));
+    let flag = |name: &str| (name.to_owned(), None);
+    let optional = |query: &mut Vec<(String, Option<String>)>, name: &str, value: Option<&str>| {
         if let Some(value) = value {
             query.push(pair(name, value));
         }
@@ -162,16 +163,15 @@ fn command_query(command: &Command<'_>) -> Vec<(String, String)> {
 }
 
 /// The query percent-encoded as SigV4 canonicalizes it, so what is sent is what is signed. A
-/// name with an empty value is sent bare, as AWS's own clients send `?uploads`.
-fn encoded_query(query: &[(String, String)]) -> String {
+/// flag is sent bare, as AWS's own clients send `?uploads`.
+fn encoded_query(query: &[(String, Option<String>)]) -> String {
     query
         .iter()
         .map(|(name, value)| {
             let name = uri_encode(name, true);
-            if value.is_empty() {
-                name
-            } else {
-                format!("{name}={}", uri_encode(value, true))
+            match value {
+                None => name,
+                Some(value) => format!("{name}={}", uri_encode(value, true)),
             }
         })
         .collect::<Vec<_>>()
@@ -200,8 +200,13 @@ impl RequestUrl {
             bucket.host()
         };
         let (authority, endpoint_path) = split_authority(&host);
-        let mut path = endpoint_path.to_owned();
-        if bucket.is_path_style() && !service {
+        // The endpoint's path is configuration, sent as `Url` spells it, as it always was:
+        // percent-encoded where needed, and with any dot segment resolved.
+        let base = Url::parse(&format!("{}://{authority}{endpoint_path}", bucket.scheme()))?;
+        let mut path = base.path().trim_end_matches('/').to_owned();
+        if service {
+            path.push('/');
+        } else if bucket.is_path_style() {
             path.push('/');
             path.push_str(&uri_encode(&bucket.name(), true));
         }
@@ -217,7 +222,7 @@ impl RequestUrl {
             bucket
                 .extra_query()
                 .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
+                .map(|(name, value)| (name.clone(), Some(value.clone()))),
         );
         Ok(RequestUrl {
             scheme: bucket.scheme(),
@@ -227,9 +232,10 @@ impl RequestUrl {
         })
     }
 
-    /// The URL as the HTTP client and the canonical request see it. `Url` would resolve a `.`
-    /// or `..` segment of the bucket name or of the endpoint's path (keys are refused in
-    /// `new`), so a path it did not keep is an error rather than a request for something else.
+    /// The URL as the HTTP client and the canonical request see it. `Url` would resolve a
+    /// bucket named `.` or `..` (keys are refused in `new`, and the endpoint's path is taken
+    /// as `Url` spells it), so a path it did not keep is an error rather than a request for
+    /// something else.
     pub(crate) fn to_url(&self) -> Result<Url, S3Error> {
         let url = Url::parse(&self.to_string())?;
         if url.path() != self.path {
@@ -293,17 +299,34 @@ mod tests {
     }
 
     #[test]
-    fn a_bucket_name_or_endpoint_path_the_url_parser_would_resolve_is_refused() {
-        for (name, endpoint) in [
-            ("..", "http://localhost:9000"),
-            ("b", "http://localhost:9000/a/../c"),
+    fn a_bucket_name_the_url_parser_would_resolve_is_refused() {
+        let url = RequestUrl::new(
+            &bucket("..", "http://localhost:9000"),
+            "key",
+            &Command::GetObject,
+        )
+        .unwrap();
+        let parsed = url.to_url();
+        assert!(
+            matches!(parsed, Err(S3Error::PathRewritten { .. })),
+            "{parsed:?}"
+        );
+    }
+
+    /// An endpoint's path is configuration: percent-encoded as a URL parser would, and a dot
+    /// segment resolved rather than refused as in a key.
+    #[test]
+    fn an_endpoint_path_is_sent_as_the_url_parser_spells_it() {
+        for (endpoint, path) in [
+            (
+                "http://localhost:9000/storage/caf\u{e9} v1",
+                "/storage/caf%C3%A9%20v1/b/key",
+            ),
+            ("http://localhost:9000/a/../c", "/c/b/key"),
         ] {
-            let url = RequestUrl::new(&bucket(name, endpoint), "key", &Command::GetObject).unwrap();
-            let parsed = url.to_url();
-            assert!(
-                matches!(parsed, Err(S3Error::PathRewritten { .. })),
-                "{name} at {endpoint}: {parsed:?}"
-            );
+            let url = RequestUrl::new(&bucket("b", endpoint), "key", &Command::GetObject).unwrap();
+            assert_eq!(url.path, path, "{endpoint}");
+            assert_eq!(url.to_url().unwrap().path(), path, "{endpoint}");
         }
     }
 
@@ -314,17 +337,18 @@ mod tests {
             authority: "h:80".to_owned(),
             path: "/b/k".to_owned(),
             query: vec![
-                ("uploads".to_owned(), String::new()),
-                ("uploadId".to_owned(), "a+b/c d~".to_owned()),
+                ("uploads".to_owned(), None),
+                ("uploadId".to_owned(), Some("a+b/c d~".to_owned())),
+                ("prefix".to_owned(), Some(String::new())),
             ],
         };
         assert_eq!(
             url.to_string(),
-            "http://h:80/b/k?uploads&uploadId=a%2Bb%2Fc%20d~"
+            "http://h:80/b/k?uploads&uploadId=a%2Bb%2Fc%20d~&prefix="
         );
         assert_eq!(
             url.to_url().unwrap().as_str(),
-            "http://h/b/k?uploads&uploadId=a%2Bb%2Fc%20d~"
+            "http://h/b/k?uploads&uploadId=a%2Bb%2Fc%20d~&prefix="
         );
     }
 }

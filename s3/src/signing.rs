@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 //! Implementation of [AWS V4 Signing][link]
 //!
 //! [link]: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html
@@ -452,6 +454,62 @@ mod tests {
         let mut hmac = Hmac::<Sha256>::new_from_slice(&signing_key.unwrap()).unwrap();
         hmac.update(string_to_sign.as_bytes());
         assert_eq!(expected, hex::encode(hmac.finalize().into_bytes()));
+    }
+
+    /// The presigned GET from the S3 documentation, "Authenticating Requests: Using Query
+    /// Parameters": the query parameters, the canonical request, and the signature.
+    #[test]
+    fn test_presigned_signing_matches_the_aws_example() {
+        let datetime = Date::from_calendar_date(2013, 5.try_into().unwrap(), 24)
+            .unwrap()
+            .with_hms(0, 0, 0)
+            .unwrap()
+            .assume_utc();
+        let region: Region = "us-east-1".parse().unwrap();
+        let params = authorization_query_params_no_sig(
+            "AKIAIOSFODNN7EXAMPLE",
+            &datetime,
+            &region,
+            86400,
+            None,
+            None,
+        )
+        .unwrap();
+        let query = params
+            .iter()
+            .map(|(name, value)| format!("{name}={}", uri_encode(value, true)))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert_eq!(
+            query,
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host"
+        );
+
+        let url = Url::parse(&format!(
+            "https://examplebucket.s3.amazonaws.com/test.txt?{query}"
+        ))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "examplebucket.s3.amazonaws.com".parse().unwrap());
+        let canonical = canonical_request("GET", &url, &headers, "UNSIGNED-PAYLOAD").unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "GET\n/test.txt\n{query}\nhost:examplebucket.s3.amazonaws.com\n\nhost\nUNSIGNED-PAYLOAD"
+            )
+        );
+
+        let string_to_sign = string_to_sign(&datetime, &region, &canonical).unwrap();
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let signing_key = signing_key(&datetime, secret, &region, "s3").unwrap();
+        let mut hmac = Hmac::<Sha256>::new_from_slice(&signing_key).unwrap();
+        hmac.update(string_to_sign.as_bytes());
+        assert_eq!(
+            hex::encode(hmac.finalize().into_bytes()),
+            "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 mod fake_s3;
 
-use fake_s3::{BUCKET, bucket, http, reply, serve, within};
+use fake_s3::{BUCKET, bucket, header_of, http, reply, serve, within};
 
 #[tokio::test]
 async fn subresources_and_ids_travel_in_the_query_and_keys_in_the_path() {
@@ -19,6 +19,11 @@ async fn subresources_and_ids_travel_in_the_query_and_keys_in_the_path() {
         )),
         reply(http("204 No Content", &[], b"")),
         reply(http("204 No Content", &[], b"")),
+        reply(http(
+            "200 OK",
+            &[],
+            b"<CopyObjectResult><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>\"e\"</ETag></CopyObjectResult>",
+        )),
     ])
     .await;
     let bucket = bucket(&endpoint);
@@ -29,6 +34,9 @@ async fn subresources_and_ids_travel_in_the_query_and_keys_in_the_path() {
         .await
         .unwrap();
     within(bucket.delete_object("a?location#x")).await.unwrap();
+    within(bucket.copy_object_internal("/a b+c?d", "/dst"))
+        .await
+        .unwrap();
     let heads = within(server).await.unwrap();
 
     let lines: Vec<&str> = heads
@@ -41,6 +49,11 @@ async fn subresources_and_ids_travel_in_the_query_and_keys_in_the_path() {
             format!("GET /{BUCKET}/?location HTTP/1.1"),
             format!("DELETE /{BUCKET}/dir/k?uploadId=a%2Bb%2Fc%3Dd%26e HTTP/1.1"),
             format!("DELETE /{BUCKET}/a%3Flocation%23x HTTP/1.1"),
+            format!("PUT /{BUCKET}/dst HTTP/1.1"),
         ]
+    );
+    assert_eq!(
+        header_of(&heads[3], "x-amz-copy-source"),
+        Some(format!("{BUCKET}/a%20b%2Bc%3Fd").as_str())
     );
 }

@@ -383,7 +383,7 @@ fn list_buckets_is_sent_to_the_service_root_whichever_bucket_asks() {
         ),
         (
             path_style("https://project.example:8443/storage/v1/s3"),
-            "https://project.example:8443/storage/v1/s3",
+            "https://project.example:8443/storage/v1/s3/",
             "project.example:8443",
         ),
     ];
@@ -392,6 +392,31 @@ fn list_buckets_is_sent_to_the_service_root_whichever_bucket_asks() {
         assert_eq!(url.as_str(), expected_url);
         assert_eq!(host, expected_host);
     }
+}
+
+#[test]
+fn an_empty_parameter_value_keeps_its_equals_sign_and_a_flag_has_none() {
+    let bucket = path_style("http://localhost:9000");
+    let listing = Command::ListObjectsV2 {
+        prefix: String::new(),
+        delimiter: None,
+        continuation_token: None,
+        start_after: None,
+        max_keys: None,
+    };
+    let (url, _) = run!(sent(&bucket, "", listing)).unwrap();
+    assert_eq!(
+        url.as_str(),
+        "http://localhost:9000/test-bucket/?prefix=&list-type=2"
+    );
+    let initiate = Command::InitiateMultipartUpload {
+        content_type: "text/plain",
+    };
+    let (url, _) = run!(sent(&bucket, KEY, initiate)).unwrap();
+    assert_eq!(
+        url.as_str(),
+        format!("http://localhost:9000/test-bucket/{ENCODED_KEY}?uploads")
+    );
 }
 
 #[test]
@@ -648,7 +673,7 @@ fn presign_with_extra_query_has_one_query_string_signed_whole() {
     let queries = HashMap::from([("acl".to_owned(), String::new())]);
     let presigned = run!(bucket.presign_get(KEY, 60, Some(queries))).unwrap();
     assert_eq!(presigned.matches('?').count(), 1, "{presigned}");
-    assert!(presigned.contains("&acl&X-Amz-Signature="), "{presigned}");
+    assert!(presigned.contains("&acl=&X-Amz-Signature="), "{presigned}");
     let pairs = query_of(&presigned);
     assert_eq!(
         names(&pairs),

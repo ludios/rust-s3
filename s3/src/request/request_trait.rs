@@ -580,15 +580,21 @@ pub trait Request {
         ))?;
         let token = credentials.security_token.or(credentials.session_token);
         let mut url = request_url(self)?;
-        url.query.extend(signing::authorization_query_params_no_sig(
+        let auth_params = signing::authorization_query_params_no_sig(
             credentials.access_key.as_deref().unwrap_or_default(),
             &self.datetime(),
             &bucket.region(),
             expiry,
             custom_headers.as_ref(),
             token.as_deref(),
-        )?);
-        url.query.extend(custom_queries.into_iter().flatten());
+        )?;
+        let custom_queries = custom_queries.into_iter().flatten();
+        url.query.extend(
+            auth_params
+                .into_iter()
+                .chain(custom_queries)
+                .map(|(name, value)| (name, Some(value))),
+        );
         let mut headers = HeaderMap::new();
         headers.insert(HOST, url.authority.parse()?);
         for (name, value) in custom_headers.iter().flatten() {
@@ -607,7 +613,7 @@ pub trait Request {
         hmac.update(string_to_sign.as_bytes());
         url.query.push((
             "X-Amz-Signature".to_owned(),
-            hex::encode(hmac.finalize().into_bytes()),
+            Some(hex::encode(hmac.finalize().into_bytes())),
         ));
         Ok(url.to_string())
     }

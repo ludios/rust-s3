@@ -391,7 +391,7 @@ impl<'a> Command<'a> {
 
     pub fn sha256(&self) -> Result<String, S3Error> {
         let result = match &self {
-            Command::PutObject { content, .. } => {
+            Command::PutObject { content, .. } | Command::UploadPart { content, .. } => {
                 let mut sha = Sha256::default();
                 sha.update(content);
                 hex::encode(sha.finalize().as_slice())
@@ -454,7 +454,6 @@ impl<'a> Command<'a> {
             }
             Command::DeleteBucketPolicy => EMPTY_PAYLOAD_SHA.into(),
             Command::CopyObject { .. } => EMPTY_PAYLOAD_SHA.into(),
-            Command::UploadPart { .. } => EMPTY_PAYLOAD_SHA.into(),
             Command::InitiateMultipartUpload { .. } => EMPTY_PAYLOAD_SHA.into(),
             Command::GetObjectAttributes { .. } => EMPTY_PAYLOAD_SHA.into(),
             Command::DeleteObjects { data } => {
@@ -464,5 +463,27 @@ impl<'a> Command<'a> {
             }
         };
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_part_hashes_the_content_it_sends() {
+        let part = Command::UploadPart {
+            part_number: 1,
+            content: b"abc",
+            upload_id: "id",
+        };
+        let put = Command::PutObject {
+            content: b"abc",
+            content_type: "text/plain",
+            custom_headers: None,
+            multipart: None,
+        };
+        assert_eq!(part.sha256().unwrap(), put.sha256().unwrap());
+        assert_ne!(part.sha256().unwrap(), EMPTY_PAYLOAD_SHA);
     }
 }

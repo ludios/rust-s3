@@ -740,8 +740,7 @@ impl Bucket {
         region: Region,
         credentials: Credentials,
     ) -> Result<crate::bucket_ops::ListBucketsResponse, S3Error> {
-        let dummy_bucket = Bucket::new("", region, credentials)?.with_path_style();
-        dummy_bucket._list_buckets().await
+        Bucket::new("", region, credentials)?._list_buckets().await
     }
 
     /// Internal helper method that performs the actual bucket listing operation.
@@ -790,11 +789,7 @@ impl Bucket {
     /// ```
     #[maybe_async::maybe_async]
     pub async fn exists(&self) -> Result<bool, S3Error> {
-        let mut dummy_bucket = self.clone();
-        dummy_bucket.name = "".into();
-
-        let response = dummy_bucket._list_buckets().await?;
-
+        let response = self._list_buckets().await?;
         Ok(response
             .bucket_names()
             .collect::<std::collections::HashSet<String>>()
@@ -1166,6 +1161,9 @@ impl Bucket {
         })
     }
 
+    /// The source key is percent-encoded into `x-amz-copy-source` as S3 requires, so it is
+    /// passed as is, like any other key.
+    ///
     /// Copy file from an S3 path, internally within the same bucket.
     ///
     /// Returns an error if S3 returns an XML error document with HTTP status 200.
@@ -1205,7 +1203,8 @@ impl Bucket {
         let fq_from = {
             let from = from.as_ref();
             let from = from.strip_prefix('/').unwrap_or(from);
-            format!("{bucket}/{path}", bucket = self.name(), path = from)
+            let path = crate::signing::uri_encode(from, false);
+            format!("{bucket}/{path}", bucket = self.name())
         };
         self.copy_object(fq_from, to).await
     }
@@ -1264,6 +1263,8 @@ impl Bucket {
         request.response_data(false).await
     }
 
+    /// The ETag of the object at `path`, or of its version `version_id`; without one, of its
+    /// current version.
     #[maybe_async::maybe_async]
     pub async fn get_object_attributes<S: AsRef<str>>(
         &self,
