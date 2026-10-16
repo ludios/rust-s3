@@ -7,6 +7,8 @@ use quick_xml::se::to_string;
 use std::collections::HashMap;
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 use std::pin::Pin;
+#[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
+use std::task::{Context, Poll, ready};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc2822;
 use url::Url;
@@ -25,8 +27,6 @@ use std::fmt::Write as _;
 
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 use futures_util::Stream;
-#[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
-use futures_util::stream::{self, StreamExt};
 
 #[derive(Debug)]
 
@@ -273,7 +273,9 @@ pub type DataStream = Pin<Box<dyn Stream<Item = StreamItem> + Send>>;
 pub type StreamItem = Result<Bytes, S3Error>;
 
 /// A response whose body is still arriving: `status_code` and `headers` are complete, and
-/// `bytes` yields the body as the server sends it.
+/// `bytes` yields the body as the server sends it. The `AsyncRead` impl reads from `bytes`
+/// too, keeping the unread tail of a chunk for its next read, so consume a body through one
+/// of the two, not both.
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 pub struct ResponseDataStream {
     pub bytes: DataStream,
@@ -281,12 +283,39 @@ pub struct ResponseDataStream {
     /// The response headers, so that a ranged GET's `Content-Range` and `Content-Length` can
     /// be checked before any of the body is read.
     pub headers: HeaderMap,
+    /// What `AsyncRead` has taken from `bytes` but not yet handed out: the tail of the last
+    /// chunk that did not fit the caller's buffer, or empty.
+    pending: Bytes,
 }
 
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 impl ResponseDataStream {
+    /// `bytes` yields the body as the server sends it; `status_code` and `headers` are the
+    /// complete response head.
+    pub fn new(bytes: DataStream, status_code: u16, headers: HeaderMap) -> ResponseDataStream {
+        ResponseDataStream {
+            bytes,
+            status_code,
+            headers,
+            pending: Bytes::new(),
+        }
+    }
+
     pub fn bytes(&mut self) -> &mut DataStream {
         &mut self.bytes
+    }
+
+    /// Polls `bytes` until `pending` holds unread body bytes, or leaves it empty because the
+    /// body has ended. Each `AsyncRead` impl then copies out what fits its buffer.
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<&mut Bytes>> {
+        while self.pending.is_empty() {
+            match ready!(self.bytes.as_mut().poll_next(cx)) {
+                Some(Ok(chunk)) => self.pending = chunk,
+                Some(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+                None => break,
+            }
+        }
+        Poll::Ready(Ok(&mut self.pending))
     }
 }
 
@@ -360,43 +389,16 @@ impl fmt::Display for ResponseData {
 impl tokio::io::AsyncRead for ResponseDataStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    ) -> Poll<std::io::Result<()>> {
         if buf.remaining() == 0 {
-            return std::task::Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(()));
         }
-
-        loop {
-            match Stream::poll_next(self.bytes.as_mut(), cx) {
-                std::task::Poll::Ready(Some(Ok(chunk))) => {
-                    if chunk.is_empty() {
-                        continue;
-                    }
-
-                    let amt = std::cmp::min(chunk.len(), buf.remaining());
-                    buf.put_slice(&chunk[..amt]);
-
-                    if amt < chunk.len() {
-                        let remainder = chunk.slice(amt..);
-                        let previous_stream =
-                            std::mem::replace(&mut self.bytes, Box::pin(stream::empty()));
-                        self.bytes = Box::pin(
-                            stream::once(async move { Ok(remainder) }).chain(previous_stream),
-                        );
-                    }
-
-                    return std::task::Poll::Ready(Ok(()));
-                }
-                std::task::Poll::Ready(Some(Err(error))) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::other(error)));
-                }
-                std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(Ok(()));
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-        }
+        let pending = ready!(self.poll_pending(cx))?;
+        let amt = std::cmp::min(pending.len(), buf.remaining());
+        buf.put_slice(&pending.split_to(amt));
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -404,43 +406,16 @@ impl tokio::io::AsyncRead for ResponseDataStream {
 impl async_std::io::Read for ResponseDataStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+    ) -> Poll<std::io::Result<usize>> {
         if buf.is_empty() {
-            return std::task::Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(0));
         }
-
-        loop {
-            match Stream::poll_next(self.bytes.as_mut(), cx) {
-                std::task::Poll::Ready(Some(Ok(chunk))) => {
-                    if chunk.is_empty() {
-                        continue;
-                    }
-
-                    let amt = std::cmp::min(chunk.len(), buf.len());
-                    buf[..amt].copy_from_slice(&chunk[..amt]);
-
-                    if amt < chunk.len() {
-                        let remainder = chunk.slice(amt..);
-                        let previous_stream =
-                            std::mem::replace(&mut self.bytes, Box::pin(stream::empty()));
-                        self.bytes = Box::pin(
-                            stream::once(async move { Ok(remainder) }).chain(previous_stream),
-                        );
-                    }
-
-                    return std::task::Poll::Ready(Ok(amt));
-                }
-                std::task::Poll::Ready(Some(Err(error))) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::other(error)));
-                }
-                std::task::Poll::Ready(None) => {
-                    return std::task::Poll::Ready(Ok(0));
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-        }
+        let pending = ready!(self.poll_pending(cx))?;
+        let amt = std::cmp::min(pending.len(), buf.len());
+        buf[..amt].copy_from_slice(&pending.split_to(amt));
+        Poll::Ready(Ok(amt))
     }
 }
 
@@ -1171,11 +1146,7 @@ mod tests {
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         // Read all data using AsyncRead
         let mut buffer = Vec::new();
@@ -1192,11 +1163,7 @@ mod tests {
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         let mut output = Vec::new();
         let mut buffer = [0u8; 10];
@@ -1219,20 +1186,13 @@ mod tests {
         // Create a stream that returns an error
         let chunks: Vec<Result<Bytes, S3Error>> = vec![
             Ok(Bytes::from("Some data")),
-            Err(S3Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Test error",
-            ))),
+            Err(S3Error::Io(std::io::Error::other("Test error"))),
         ];
 
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         // First read should succeed
         let mut buffer = [0u8; 20];
@@ -1257,11 +1217,7 @@ mod tests {
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         let mut output = Vec::new();
         tokio::io::copy(&mut response_stream, &mut output)
@@ -1269,6 +1225,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, b"First chunk\nSecond chunk\nThird chunk\n");
+    }
+
+    /// A body read with a buffer far smaller than its chunks. Every read but a chunk's last
+    /// leaves a remainder; the reader must stay flat across more than 100k of them.
+    #[tokio::test]
+    async fn test_async_read_many_short_reads() {
+        let body: Vec<u8> = (0..800_000u32).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<StreamItem> = body
+            .chunks(100_000)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let mut response_stream =
+            ResponseDataStream::new(Box::pin(stream::iter(chunks)), 200, HeaderMap::new());
+
+        let mut output = Vec::with_capacity(body.len());
+        let mut buffer = [0u8; 7];
+        let mut reads = 0usize;
+        loop {
+            let n = response_stream.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..n]);
+            reads += 1;
+        }
+
+        assert!(reads > 100_000, "{reads} reads");
+        assert!(output == body, "streamed bytes differ from the body");
     }
 }
 
@@ -1291,11 +1275,7 @@ mod async_std_tests {
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         // Read all data using AsyncRead
         let mut buffer = Vec::new();
@@ -1312,11 +1292,7 @@ mod async_std_tests {
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         let mut output = Vec::new();
         let mut buffer = [0u8; 10];
@@ -1339,20 +1315,13 @@ mod async_std_tests {
         // Create a stream that returns an error
         let chunks: Vec<Result<Bytes, S3Error>> = vec![
             Ok(Bytes::from("Some data")),
-            Err(S3Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Test error",
-            ))),
+            Err(S3Error::Io(std::io::Error::other("Test error"))),
         ];
 
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         // First read should succeed
         let mut buffer = [0u8; 20];
@@ -1377,11 +1346,7 @@ mod async_std_tests {
         let stream = stream::iter(chunks);
         let data_stream: DataStream = Box::pin(stream);
 
-        let mut response_stream = ResponseDataStream {
-            bytes: data_stream,
-            status_code: 200,
-            headers: HeaderMap::new(),
-        };
+        let mut response_stream = ResponseDataStream::new(data_stream, 200, HeaderMap::new());
 
         let mut output = Vec::new();
         async_std::io::copy(&mut response_stream, &mut output)
@@ -1389,5 +1354,33 @@ mod async_std_tests {
             .unwrap();
 
         assert_eq!(output, b"First chunk\nSecond chunk\nThird chunk\n");
+    }
+
+    /// A body read with a buffer far smaller than its chunks. Every read but a chunk's last
+    /// leaves a remainder; the reader must stay flat across more than 100k of them.
+    #[async_std::test]
+    async fn test_async_read_many_short_reads() {
+        let body: Vec<u8> = (0..800_000u32).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<StreamItem> = body
+            .chunks(100_000)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let mut response_stream =
+            ResponseDataStream::new(Box::pin(stream::iter(chunks)), 200, HeaderMap::new());
+
+        let mut output = Vec::with_capacity(body.len());
+        let mut buffer = [0u8; 7];
+        let mut reads = 0usize;
+        loop {
+            let n = response_stream.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..n]);
+            reads += 1;
+        }
+
+        assert!(reads > 100_000, "{reads} reads");
+        assert!(output == body, "streamed bytes differ from the body");
     }
 }

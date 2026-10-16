@@ -396,11 +396,11 @@ impl<'a> Request for ReqwestRequest<'a> {
         let status_code = observed.response.status().as_u16();
         let headers = observed.response.headers().clone();
 
-        Ok(ResponseDataStream {
-            bytes: Box::pin(observed.body()),
+        Ok(ResponseDataStream::new(
+            Box::pin(observed.body()),
             status_code,
             headers,
-        })
+        ))
     }
 
     async fn response_header(&self) -> Result<(Self::HeaderMap, u16), S3Error> {

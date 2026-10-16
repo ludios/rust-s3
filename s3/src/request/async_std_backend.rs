@@ -322,11 +322,7 @@ impl<'a> Request for SurfRequest<'a> {
 
         let body = body_stream(response.take_body());
 
-        Ok(ResponseDataStream {
-            bytes: body,
-            status_code: status_code.into(),
-            headers,
-        })
+        Ok(ResponseDataStream::new(body, status_code.into(), headers))
     }
 }
 
