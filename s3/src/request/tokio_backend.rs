@@ -47,6 +47,13 @@ pub(crate) struct ClientOptions {
 
 #[cfg(feature = "with-tokio")]
 pub(crate) fn client(options: &ClientOptions) -> Result<reqwest::Client, S3Error> {
+    // reqwest is built without a rustls crypto provider and panics when it builds a rustls
+    // client with no process-wide default, so install ring unless the program already
+    // installed a provider (then `install_default` fails, which is fine). With native TLS
+    // also enabled, reqwest uses that and rustls is never reached.
+    #[cfg(all(feature = "tokio-rustls-tls", not(feature = "tokio-native-tls")))]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Request timeouts are applied to individual requests so changing a
     // Bucket's timeout does not require rebuilding this client (or lose its
     // proxy/TLS configuration).

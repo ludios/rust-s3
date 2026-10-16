@@ -76,6 +76,8 @@ To build with Tokio and rustls backed by ring, disable the default native-TLS fe
 cargo build -p rust-s3 --no-default-features --features tokio-rustls-tls-ring
 ```
 
+With `tokio-rustls-tls` (which `tokio-rustls-tls-ring` includes), the first `Bucket` installs ring as the process-wide rustls `CryptoProvider` unless the program installed one already; to use another provider, install it before creating a `Bucket`. Server certificates are checked against the operating system's trust store.
+
 The default feature set remains Tokio with native TLS.
 
 #### Path or subdomain style URLs and headers
