@@ -19,8 +19,9 @@ pub enum S3Error {
     InvalidListObjectsPagination(&'static str),
     #[error("header '{0}' cannot be applied to a streamed multipart upload")]
     UnsupportedMultipartHeader(http::header::HeaderName),
-    /// An object key with a `.` or `..` path segment, refused before any request or presigned
-    /// URL is built: URL parsing would resolve the segment and address a different object.
+    /// An object key with a `.` or `..` path segment, refused before any request is sent or URL
+    /// presigned: URL parsing would resolve the segment and address a different object.
+    /// `Bucket::delete_objects`, which sends keys in the request body, can still delete one.
     #[error("object key {0:?} has a '.' or '..' segment, which a URL cannot carry unchanged")]
     DotSegmentKey(String),
     #[error("aws-creds: {0}")]

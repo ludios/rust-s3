@@ -327,7 +327,7 @@ body-bearing operations. The post-repair provider matrix passed as recorded belo
 
 ## Further coverage needed
 
-- Signing: repeated header values and whitespace, dot-segment object keys, reserved characters in upload/version identifiers, and presigned requests using temporary credentials. Query ordering is the only signing repair in this batch. Dot-segment object keys were later found to address another object, or in path style another bucket; they are now refused with `S3Error::DotSegmentKey`.
+- Signing: repeated header values and whitespace, reserved characters in upload/version identifiers, and presigned requests using temporary credentials. Query ordering is the only signing repair in this batch. (Dot-segment object keys were also listed here. URL parsing resolved them into another object, or in path style another bucket; they are now refused with `S3Error::DotSegmentKey`.)
 - XML: fuzz representative list, error, tagging, lifecycle, and multipart responses; distinguish malformed/truncated responses from empty results.
 - Features: document supported combinations, test blocking wrappers and `tags`/`fail-on-err` independently, and establish a tested minimum Rust version. Mutually exclusive runtime features make a blanket `--all-features` check unsuitable for the main crate.
 - Sync documentation: the first batch exposed 29 doctest compile failures and temporarily limited sync CI to `--lib`. Resolved in the test-suite follow-up below, which restores doctests and example compilation.

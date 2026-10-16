@@ -794,7 +794,7 @@ pub trait Request {
             .split('/')
             .any(|segment| segment == "." || segment == "..")
         {
-            return Err(S3Error::DotSegmentKey(path));
+            return Err(S3Error::DotSegmentKey(self.path().to_string()));
         }
         let encoded_path = signing::uri_encode(&path, false);
 
