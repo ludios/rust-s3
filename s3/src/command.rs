@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 //! This module defines and manages various commands used for interacting with Amazon S3, encapsulating common operations such as creating buckets, uploading objects, and managing multipart uploads.
 //! It also provides utilities for calculating necessary metadata (like content length and SHA-256 hashes) required for secure and efficient communication with the S3 service.
 //!
@@ -184,6 +186,14 @@ pub enum Command<'a> {
 }
 
 impl<'a> Command<'a> {
+    /// A GET of bytes `start..=end` of an object, or `start..` to its end when `end` is `None`.
+    pub(crate) fn get_object_range(start: u64, end: Option<u64>) -> Self {
+        if let Some(end) = end {
+            assert!(start <= end, "range start {start} is past its end {end}");
+        }
+        Command::GetObjectRange { start, end }
+    }
+
     /// Whether this command can be replayed after an ambiguous transport failure.
     ///
     /// This intentionally describes request semantics rather than HTTP verbs:

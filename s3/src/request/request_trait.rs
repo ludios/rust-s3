@@ -278,8 +278,8 @@ pub type StreamItem = Result<Bytes, S3Error>;
 pub struct ResponseDataStream {
     pub bytes: DataStream,
     pub status_code: u16,
-    /// The response headers. A ranged GET's `Content-Length` and `Content-Range` say what
-    /// the body will hold before any of it is read.
+    /// The response headers, so that a ranged GET's `Content-Range` and `Content-Length` can
+    /// be checked before any of the body is read.
     pub headers: HeaderMap,
 }
 

@@ -218,16 +218,18 @@ async fn surf_response_attempt(
     Ok(response)
 }
 
-/// `response`'s headers as an `http::HeaderMap`.
+/// `response`'s headers as an `http::HeaderMap`, every value of a repeated header included.
+/// Values are trimmed: RFC 9110 excludes the whitespace around a value, and async-h1
+/// synthesizes a missing `Date` with a trailing CRLF, which `http` would reject.
 fn header_map(response: &surf::Response) -> Result<HeaderMap, S3Error> {
     let mut header_map = HeaderMap::new();
-    for (name, value) in response.iter() {
-        header_map.insert(
-            http::header::HeaderName::from_lowercase(
-                name.to_string().to_ascii_lowercase().as_ref(),
-            )?,
-            value.as_str().parse()?,
-        );
+    for (name, values) in response.iter() {
+        let name = http::header::HeaderName::from_lowercase(
+            name.to_string().to_ascii_lowercase().as_ref(),
+        )?;
+        for value in values {
+            header_map.append(name.clone(), value.as_str().trim().parse()?);
+        }
     }
     Ok(header_map)
 }
@@ -749,6 +751,7 @@ mod tests {
         .await
         .expect("stream response should be available before consuming body")
         .unwrap();
+        assert_eq!(response.headers["content-length"], "6");
         let mut prefix = Vec::new();
         while prefix.len() < 3 {
             let next = async_std::future::timeout(

@@ -1639,11 +1639,7 @@ impl Bucket {
         start: u64,
         end: Option<u64>,
     ) -> Result<ResponseData, S3Error> {
-        if let Some(end) = end {
-            assert!(start <= end);
-        }
-
-        let command = Command::GetObjectRange { start, end };
+        let command = Command::get_object_range(start, end);
         let request = RequestImpl::new(self, path.as_ref(), command).await?;
         request.response_data(false).await
     }
@@ -1700,11 +1696,7 @@ impl Bucket {
         T: AsyncWrite + Send + Unpin + ?Sized,
         S: AsRef<str>,
     {
-        if let Some(end) = end {
-            assert!(start <= end);
-        }
-
-        let command = Command::GetObjectRange { start, end };
+        let command = Command::get_object_range(start, end);
         let request = RequestImpl::new(self, path.as_ref(), command).await?;
         request.response_data_to_writer(writer).await
     }
@@ -1717,11 +1709,7 @@ impl Bucket {
         end: Option<u64>,
         writer: &mut T,
     ) -> Result<u16, S3Error> {
-        if let Some(end) = end {
-            assert!(start <= end);
-        }
-
-        let command = Command::GetObjectRange { start, end };
+        let command = Command::get_object_range(start, end);
         let request = RequestImpl::new(self, path.as_ref(), command)?;
         request.response_data_to_writer(writer)
     }
@@ -1837,8 +1825,9 @@ impl Bucket {
     }
 
     /// Stream bytes `start..=end` of the object at `path`, or `start..` to its end when `end`
-    /// is `None`. A satisfiable range is answered with status 206, and the stream's `headers`
-    /// carry its `Content-Length` and `Content-Range`.
+    /// is `None`. The stream reports the status and headers the server answered with, which a
+    /// caller checks before reading the body: a satisfiable range gets a 206 whose
+    /// `Content-Range` names the bytes that follow.
     ///
     /// # Example:
     ///
@@ -1878,11 +1867,7 @@ impl Bucket {
         start: u64,
         end: Option<u64>,
     ) -> Result<ResponseDataStream, S3Error> {
-        if let Some(end) = end {
-            assert!(start <= end, "range start {start} is past its end {end}");
-        }
-
-        let command = Command::GetObjectRange { start, end };
+        let command = Command::get_object_range(start, end);
         let request = RequestImpl::new(self, path.as_ref(), command).await?;
         request.response_data_to_stream().await
     }
