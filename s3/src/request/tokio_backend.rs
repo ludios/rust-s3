@@ -116,14 +116,26 @@ struct ObservedResponse {
 }
 
 impl ObservedResponse {
+    /// The body, with its idle timer created here, inside the runtime, so that the stream may
+    /// then be polled from anywhere.
     fn body(self) -> ObservedBody {
         ObservedBody {
             stream: Box::pin(self.response.bytes_stream()),
             observer: self.observer,
-            idle_limit: self.idle_limit,
-            idle_timer: None,
+            idle: self
+                .idle_limit
+                .map(|limit| (limit, Box::pin(tokio::time::sleep(limit)))),
+            idle_armed: false,
         }
     }
+}
+
+/// `limit` from now as a timer deadline, capped as tokio caps `sleep` for a limit too far
+/// ahead to represent.
+fn idle_deadline(limit: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(limit)
+        .unwrap_or(now + Duration::from_secs(86400 * 365 * 30))
 }
 
 /// The body stream of one response, teed into its `BodyObserver` and bounded by the bucket's
@@ -135,48 +147,55 @@ impl ObservedResponse {
 struct ObservedBody {
     stream: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     observer: Option<Box<dyn BodyObserver>>,
-    /// How long one wait for the next chunk may last, if bounded at all.
-    idle_limit: Option<Duration>,
-    /// Runs while a chunk is awaited: armed by a poll that found none, dropped by the next
-    /// chunk. A body that keeps arriving never times out, however long it is.
-    idle_timer: Option<Pin<Box<Sleep>>>,
+    /// How long one wait for the next chunk may last, and the timer that enforces it, if
+    /// bounded at all. Armed by a poll that found no chunk, disarmed by the next chunk or by
+    /// firing, so that a poll after a timeout waits a fresh limit. A body that keeps arriving
+    /// never times out, however long it is.
+    idle: Option<(Duration, Pin<Box<Sleep>>)>,
+    idle_armed: bool,
 }
 
 impl Stream for ObservedBody {
     type Item = Result<Bytes, S3Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
         // The stream is polled first, so a chunk that is ready goes out even if the timer
         // lapsed while the consumer was busy with something else.
-        let item = match self.stream.as_mut().poll_next(cx) {
+        let item = match this.stream.as_mut().poll_next(cx) {
             Poll::Ready(item) => {
-                self.idle_timer = None;
+                this.idle_armed = false;
                 item.map(|chunk| chunk.map_err(S3Error::Reqwest))
             }
             Poll::Pending => {
-                let Some(limit) = self.idle_limit else {
+                let Some((limit, timer)) = &mut this.idle else {
                     return Poll::Pending;
                 };
-                let timer = self
-                    .idle_timer
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+                if !this.idle_armed {
+                    timer.as_mut().reset(idle_deadline(*limit));
+                    this.idle_armed = true;
+                }
                 ready!(timer.as_mut().poll(cx));
-                Some(Err(S3Error::Io(timeout_error("response body data", limit))))
+                this.idle_armed = false;
+                Some(Err(S3Error::Io(timeout_error(
+                    "response body data",
+                    *limit,
+                ))))
             }
         };
         match &item {
             Some(Ok(bytes)) => {
-                if let Some(observer) = &mut self.observer {
+                if let Some(observer) = &mut this.observer {
                     observer.chunk(bytes);
                 }
             }
             Some(Err(error)) => {
-                if let Some(observer) = self.observer.take() {
+                if let Some(observer) = this.observer.take() {
                     observer.end(BodyEnd::Error(error));
                 }
             }
             None => {
-                if let Some(observer) = self.observer.take() {
+                if let Some(observer) = this.observer.take() {
                     observer.end(BodyEnd::Eof);
                 }
             }
@@ -729,14 +748,20 @@ mod tests {
             prefix.extend_from_slice(&chunk);
         }
         assert_eq!(&prefix[..3], b"abc");
-        let next = tokio::time::timeout(Duration::from_secs(2), body_stream.bytes.next())
-            .await
-            .expect("body timeout should be bounded");
-        assert!(matches!(
-            next.expect("body should report its timeout"),
-            Err(crate::error::S3Error::Io(ref error))
-                if error.kind() == std::io::ErrorKind::TimedOut
-        ));
+        // Each poll of the stalled body waits out the limit; a poll after a timeout does the
+        // same again rather than failing at once.
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let next = tokio::time::timeout(Duration::from_secs(2), body_stream.bytes.next())
+                .await
+                .expect("body timeout should be bounded");
+            assert!(matches!(
+                next.expect("body should report its timeout"),
+                Err(crate::error::S3Error::Io(ref error))
+                    if error.kind() == std::io::ErrorKind::TimedOut
+            ));
+            assert!(started.elapsed() >= Duration::from_millis(400));
+        }
         let _ = stop.send(());
         server.join().unwrap();
 

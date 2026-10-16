@@ -32,9 +32,11 @@ pub struct AttoRequest<'a> {
 }
 
 /// A session carrying `request`'s signed headers, with the bucket's `request_timeout` as its
-/// connect and read timeouts, so that a transfer that keeps moving never times out, however
-/// large. Without one, attohttpc's own 30-second defaults for both stay.
-fn session(request: &AttoRequest<'_>) -> Result<attohttpc::Session, S3Error> {
+/// connect and read timeouts, so that a download that keeps moving never times out, however
+/// large. attohttpc bounds no write, so a request that sends a `body` keeps the whole-request
+/// deadline as well: its upload has to finish within the limit. Without a limit, attohttpc's
+/// own 30-second connect and read defaults stay.
+fn session(request: &AttoRequest<'_>, body: &[u8]) -> Result<attohttpc::Session, S3Error> {
     let mut session = attohttpc::Session::new();
     for (name, value) in request.headers()?.iter() {
         session.header(HeaderName::from_bytes(name.as_ref())?, value.to_str()?);
@@ -42,6 +44,9 @@ fn session(request: &AttoRequest<'_>) -> Result<attohttpc::Session, S3Error> {
     if let Some(limit) = request.bucket.request_timeout {
         session.connect_timeout(limit);
         session.read_timeout(limit);
+        if !body.is_empty() {
+            session.timeout(limit);
+        }
     }
     Ok(session)
 }
@@ -102,7 +107,8 @@ fn decoded_download_encoding(
 /// Sends `request` once, through [`session`], to its URL with its body, and returns whatever
 /// response arrives.
 fn send(request: &AttoRequest<'_>) -> Result<attohttpc::Response, RequestAttemptError> {
-    let session = session(request)?;
+    let body = request.request_body()?;
+    let session = session(request, &body)?;
     let url = request.url()?;
     let builder = match request.command.http_verb() {
         HttpMethod::Get => session.get(url),
@@ -111,7 +117,7 @@ fn send(request: &AttoRequest<'_>) -> Result<attohttpc::Response, RequestAttempt
         HttpMethod::Post => session.post(url),
         HttpMethod::Head => session.head(url),
     };
-    Ok(builder.bytes(&request.request_body()?).send()?)
+    Ok(builder.bytes(&body).send()?)
 }
 
 /// Sends `request` once and returns its response, or the failure its status reports under
@@ -296,8 +302,9 @@ mod tests {
     use awscreds::Credentials;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // Fake keys - otherwise using Credentials::default will use actual user
     // credentials if they exist.
@@ -308,10 +315,12 @@ mod tests {
     }
 
     /// Serves one request on a local socket, answering with `script`: each step sleeps for
-    /// its delay, then writes its bytes. Returns the endpoint.
-    fn serve_script(script: Vec<(Duration, &'static [u8])>) -> String {
+    /// its delay, then writes its bytes. Returns the endpoint, and a channel that reports when
+    /// the request head has been read and the script begins.
+    fn serve_script(script: Vec<(Duration, &'static [u8])>) -> (String, mpsc::Receiver<Instant>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
@@ -322,6 +331,7 @@ mod tests {
                 }
                 request.push(byte[0]);
             }
+            let _ = started_tx.send(Instant::now());
             for (delay, bytes) in script {
                 thread::sleep(delay);
                 if stream.write_all(bytes).is_err() {
@@ -329,7 +339,7 @@ mod tests {
                 }
             }
         });
-        endpoint
+        (endpoint, started_rx)
     }
 
     fn timeout_bucket(endpoint: String, limit: Duration) -> Bucket {
@@ -348,7 +358,7 @@ mod tests {
     fn request_timeout_resets_with_each_body_chunk() {
         // Three gaps add up to more than the limit; each alone is within it.
         let gap = Duration::from_millis(400);
-        let endpoint = serve_script(vec![
+        let (endpoint, _) = serve_script(vec![
             (
                 Duration::ZERO,
                 b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n",
@@ -366,8 +376,24 @@ mod tests {
     }
 
     #[test]
+    fn request_timeout_bounds_a_stalled_upload() {
+        // The server reads the request head and nothing more for three seconds, so a body
+        // larger than the socket buffers blocks the client's write until the deadline cuts the
+        // connection. Signing hashes the body first, so time is taken from the stall's start.
+        let (endpoint, stalled) = serve_script(vec![(Duration::from_secs(3), b"")]);
+        let bucket = timeout_bucket(endpoint, Duration::from_millis(300));
+
+        let error = bucket
+            .put_object("/object", &vec![0u8; 32 << 20])
+            .expect_err("a stalled upload must time out");
+        let stalled_for = stalled.recv().unwrap().elapsed();
+        assert!(matches!(error, S3Error::Atto(_)), "{error:?}");
+        assert!(stalled_for < Duration::from_secs(2), "{stalled_for:?}");
+    }
+
+    #[test]
     fn request_timeout_fails_a_stalled_body() {
-        let endpoint = serve_script(vec![
+        let (endpoint, _) = serve_script(vec![
             (
                 Duration::ZERO,
                 b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc",

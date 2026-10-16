@@ -101,7 +101,7 @@ pub async fn read_chunk_async<R: AsyncRead + Unpin + ?Sized>(
 /// keeps a partly read chunk when the `next()` polling it is dropped, so a read can be raced
 /// against other work.
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
-pub fn chunk_stream<R: AsyncRead + Unpin + ?Sized>(
+pub(crate) fn chunk_stream<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
 ) -> impl futures_util::Stream<Item = Result<Vec<u8>, S3Error>> + '_ {
     futures_util::stream::try_unfold((reader, false), |(reader, done)| async move {

@@ -1,7 +1,8 @@
 // Model-output: Claude Fable 5.1
 
 //! `put_object_stream` against the fake S3: the parts in flight are driven while the next
-//! chunk is still being read.
+//! chunk is still being read. The request observer is process-wide and set once, so this
+//! binary holds one test.
 
 #![cfg(feature = "with-tokio")]
 
@@ -19,34 +20,36 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::oneshot;
 
-/// Fires its gate when the backend hands the first part to reqwest.
+/// Fires its gate when the response to the first part arrives: by then that part has been
+/// sent in full and answered.
 struct GateOpener(Mutex<Option<oneshot::Sender<()>>>);
 
 impl RequestObserver for GateOpener {
-    fn on_request(&self, _: u64, _: u32, _: &Bucket, request: &s3::reqwest::Request) {
-        let first_part = request
-            .url()
-            .query()
-            .is_some_and(|query| query.split('&').any(|pair| pair == "partNumber=1"));
-        if first_part && let Some(gate) = self.0.lock().unwrap().take() {
-            let _ = gate.send(());
-        }
-    }
+    fn on_request(&self, _: u64, _: u32, _: &Bucket, _: &s3::reqwest::Request) {}
 
     fn on_response(
         &self,
         _: u64,
         _: u32,
         _: Duration,
-        _: Result<&s3::reqwest::Response, &s3::error::S3Error>,
+        result: Result<&s3::reqwest::Response, &s3::error::S3Error>,
     ) -> Option<Box<dyn BodyObserver>> {
+        let first_part = result.is_ok_and(|response| {
+            response
+                .url()
+                .query()
+                .is_some_and(|query| query.split('&').any(|pair| pair == "partNumber=1"))
+        });
+        if first_part && let Some(gate) = self.0.lock().unwrap().take() {
+            let _ = gate.send(());
+        }
         None
     }
 }
 
 /// Two full chunks of `x`. The second is held back until the gate fires, so that reading it
-/// takes at least as long as the backend takes to send the first part. An upload that only
-/// sends parts between reads never gets past this reader.
+/// takes at least as long as the first part takes to be sent and answered. An upload that
+/// drives its parts only between reads never gets past this reader.
 struct GatedReader {
     gate: Option<oneshot::Receiver<()>>,
     remaining: usize,

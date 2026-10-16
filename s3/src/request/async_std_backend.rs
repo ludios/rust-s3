@@ -55,11 +55,14 @@ fn surf_client() -> Result<&'static surf::Client, S3Error> {
 
 /// A response body whose reads are bounded by the bucket's `request_timeout`: a read that
 /// finds no data arms a timer, the next data disarms it, and a read still waiting when it
-/// fires fails with `TimedOut`. A body that keeps arriving never times out, however long.
+/// fires fails with `TimedOut`, after which a further read waits a fresh limit. A body that
+/// keeps arriving never times out, however long. Once the body has ended, so has this reader,
+/// whatever the body would say to being read again.
 struct IdleReader {
     body: surf::http::Body,
     limit: Duration,
     timer: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
+    ended: bool,
 }
 
 impl async_std::io::Read for IdleReader {
@@ -69,10 +72,14 @@ impl async_std::io::Read for IdleReader {
         buffer: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.as_mut().get_mut();
+        if buffer.is_empty() || this.ended {
+            return Poll::Ready(Ok(0));
+        }
         // The body is polled first, so data that is ready goes out even if the timer lapsed
         // while nobody was reading.
         if let Poll::Ready(result) = Pin::new(&mut this.body).poll_read(context, buffer) {
             this.timer = None;
+            this.ended = matches!(result, Ok(0));
             return Poll::Ready(result);
         }
         let limit = this.limit;
@@ -80,7 +87,10 @@ impl async_std::io::Read for IdleReader {
             .timer
             .get_or_insert_with(|| Box::pin(async_std::task::sleep(limit)));
         match timer.as_mut().poll(context) {
-            Poll::Ready(()) => Poll::Ready(Err(timeout_error("response body data", limit))),
+            Poll::Ready(()) => {
+                this.timer = None;
+                Poll::Ready(Err(timeout_error("response body data", limit)))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -134,6 +144,7 @@ fn apply_body_timeout(mut response: surf::Response, limit: Option<Duration>) -> 
             body,
             limit,
             timer: None,
+            ended: false,
         });
     }
     response
@@ -665,14 +676,60 @@ mod tests {
         .unwrap();
         assert!(request_line.starts_with("PUT "));
 
-        let body_result =
-            async_std::future::timeout(std::time::Duration::from_secs(2), response.body_bytes())
-                .await
-                .expect("body timeout should be shorter than the outer bound");
-        assert!(
-            body_result.is_err(),
-            "raw Surf response body must keep its idle timeout"
+        use async_std::io::ReadExt;
+        let mut body = response.take_body();
+        let mut prefix = Vec::new();
+        let mut buffer = [0; 16];
+        while prefix.len() < 3 {
+            let read = async_std::future::timeout(
+                std::time::Duration::from_secs(2),
+                body.read(&mut buffer),
+            )
+            .await
+            .expect("the prefix should arrive promptly")
+            .expect("the prefix read should succeed");
+            prefix.extend_from_slice(&buffer[..read]);
+        }
+        assert_eq!(prefix, b"abc");
+        // Each read of the stalled body waits out the limit; a read after a timeout does the
+        // same again rather than failing at once or panicking.
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let error = async_std::future::timeout(
+                std::time::Duration::from_secs(2),
+                body.read(&mut buffer),
+            )
+            .await
+            .expect("body timeout should be shorter than the outer bound")
+            .expect_err("raw Surf response body must keep its idle timeout");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        }
+        server.finish().await.unwrap();
+    }
+
+    #[async_std::test]
+    async fn request_timeout_covers_buffered_body_reads() {
+        let server = start_paused_server(200, b"abcdef".to_vec(), PauseAt::AfterPrefix(3)).await;
+        let bucket = timeout_bucket(
+            server.endpoint.clone(),
+            Some(std::time::Duration::from_millis(400)),
         );
+        let request = SurfRequest::new(&bucket, "/object", Command::GetObject)
+            .await
+            .unwrap();
+
+        let result = async_std::future::timeout(
+            std::time::Duration::from_secs(3),
+            request.response_data(false),
+        )
+        .await
+        .expect("buffered read should be bounded");
+        assert!(matches!(
+            result,
+            Err(crate::error::S3Error::Io(error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
         server.finish().await.unwrap();
     }
 

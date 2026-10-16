@@ -324,7 +324,6 @@ impl MultipartHeaderPlan {
     }
 }
 
-#[cfg(feature = "sync")]
 fn part_from_response(response_data: ResponseData, part_number: u32) -> Result<Part, S3Error> {
     if !(200..300).contains(&response_data.status_code()) {
         return Err(response_error_from_data(response_data));
@@ -1041,41 +1040,10 @@ impl Bucket {
     }
 
     /// A copy of this bucket with `request_timeout` set; see [`Bucket::set_request_timeout`].
-    #[cfg(not(feature = "with-tokio"))]
     pub fn with_request_timeout(&self, request_timeout: Duration) -> Result<Box<Bucket>, S3Error> {
-        Ok(Box::new(Bucket {
-            name: self.name.clone(),
-            region: self.region.clone(),
-            credentials: self.credentials.clone(),
-            #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
-            credentials_refresh_gate: self.credentials_refresh_gate.clone(),
-            extra_headers: self.extra_headers.clone(),
-            extra_query: self.extra_query.clone(),
-            request_timeout: Some(request_timeout),
-            path_style: self.path_style,
-            listobjects_v2: self.listobjects_v2,
-        }))
-    }
-
-    /// A copy of this bucket with `request_timeout` set; see [`Bucket::set_request_timeout`].
-    #[cfg(feature = "with-tokio")]
-    pub fn with_request_timeout(&self, request_timeout: Duration) -> Result<Box<Bucket>, S3Error> {
-        Ok(Box::new(Bucket {
-            name: self.name.clone(),
-            region: self.region.clone(),
-            credentials: self.credentials.clone(),
-            #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
-            credentials_refresh_gate: self.credentials_refresh_gate.clone(),
-            extra_headers: self.extra_headers.clone(),
-            extra_query: self.extra_query.clone(),
-            request_timeout: Some(request_timeout),
-            path_style: self.path_style,
-            listobjects_v2: self.listobjects_v2,
-            #[cfg(feature = "with-tokio")]
-            http_client: self.http_client(),
-            #[cfg(feature = "with-tokio")]
-            client_options: self.client_options.clone(),
-        }))
+        let mut bucket = self.clone();
+        bucket.request_timeout = Some(request_timeout);
+        Ok(Box::new(bucket))
     }
 
     pub fn with_listobjects_v1(&self) -> Bucket {
@@ -2205,79 +2173,46 @@ impl Bucket {
             std::num::NonZeroUsize::get,
         );
 
-        use futures_util::FutureExt;
-        use futures_util::future::{Either, select};
-        use futures_util::stream::{FuturesUnordered, StreamExt};
+        use futures_util::{StreamExt, TryStreamExt, stream};
 
-        // Keep all part futures inside this scope. If reading or a part fails,
-        // leaving the scope drops the outstanding futures before abort starts.
+        // The parts in flight are driven while the next chunk is read, so that a slow reader
+        // neither delays their start nor leaves a finished one unnoticed: `try_buffer_unordered`
+        // pulls a chunk only while fewer than `max_concurrent_chunks` parts are in flight, and
+        // polls those parts whenever it is polled itself. Everything stays inside this scope, so
+        // that when reading or a part fails, the outstanding parts are dropped before abort.
         let upload_result: Result<(Vec<(u32, String)>, usize), S3Error> = async {
-            let mut etags = Vec::new();
-            let mut active_uploads: FuturesUnordered<
-                futures_util::future::BoxFuture<'_, (u32, Result<ResponseData, S3Error>)>,
-            > = FuturesUnordered::new();
-            let mut chunks = std::pin::pin!(crate::utils::chunk_stream(reader).fuse());
-            let mut reading_done = false;
-            let mut total_size = first_chunk.len();
-            let mut part_number: u32 = 1;
-
-            let upload_part = |chunk: Vec<u8>, part_number: u32| {
-                let bucket = self.clone();
-                let upload_id = upload_id.clone();
-                let content_type = content_type.to_string();
-                let part_headers = header_plan.part.clone();
-                async move {
-                    let result = bucket
-                        .make_multipart_request(
-                            path,
-                            chunk,
-                            part_number,
-                            &upload_id,
-                            &content_type,
-                            &part_headers,
-                        )
-                        .await;
-                    (part_number, result)
-                }
-                .boxed()
+            let part_headers = &header_plan.part;
+            let upload_part = move |chunk: Vec<u8>, part_number: u32| async move {
+                let response = self
+                    .make_multipart_request(
+                        path,
+                        chunk,
+                        part_number,
+                        upload_id,
+                        content_type,
+                        part_headers,
+                    )
+                    .await?;
+                part_from_response(response, part_number)
             };
-            active_uploads.push(upload_part(first_chunk, part_number));
-
-            // The parts in flight are driven while the next chunk is read, so that a slow
-            // reader neither delays their start nor leaves a finished one unnoticed. Whichever
-            // is ready first is handled; the other keeps its progress.
-            loop {
-                let want_chunk = !reading_done && active_uploads.len() < max_concurrent_chunks;
-                let ready = if !want_chunk && active_uploads.is_empty() {
-                    break;
-                } else if !want_chunk {
-                    Either::Left(active_uploads.next().await.expect("a part is in flight"))
-                } else if active_uploads.is_empty() {
-                    Either::Right(chunks.next().await)
-                } else {
-                    match select(active_uploads.next(), chunks.next()).await {
-                        Either::Left((part, _)) => Either::Left(part.expect("a part is in flight")),
-                        Either::Right((chunk, _)) => Either::Right(chunk),
-                    }
-                };
-                match ready {
-                    Either::Left((part_number, result)) => {
-                        let response_data = result?;
-                        if !(200..300).contains(&response_data.status_code()) {
-                            return Err(response_error_from_data(response_data));
-                        }
-                        etags.push((part_number, response_data.as_str()?.to_string()));
-                    }
-                    Either::Right(Some(chunk)) => {
-                        let chunk = chunk?;
-                        total_size += chunk.len();
-                        part_number += 1;
-                        active_uploads.push(upload_part(chunk, part_number));
-                    }
-                    Either::Right(None) => reading_done = true,
+            let mut part_number = 0u32;
+            let mut total_size = 0usize;
+            let mut etags = Vec::new();
+            {
+                let mut parts = std::pin::pin!(
+                    stream::once(async { Ok(first_chunk) })
+                        .chain(crate::utils::chunk_stream(reader))
+                        .map_ok(|chunk| {
+                            part_number += 1;
+                            total_size += chunk.len();
+                            upload_part(chunk, part_number)
+                        })
+                        .try_buffer_unordered(max_concurrent_chunks)
+                );
+                while let Some(part) = parts.try_next().await? {
+                    etags.push((part.part_number, part.etag));
                 }
             }
-
             Ok((etags, total_size))
         }
         .await;
@@ -3619,7 +3554,23 @@ impl Bucket {
     /// waiting for the headers is retried like other transient failures.
     ///
     /// The synchronous backend maps the limit onto its transport's connect and read
-    /// timeouts, which keep that transport's own 30-second defaults under `None`.
+    /// timeouts, which keep that transport's own 30-second defaults under `None`, and keeps
+    /// it as the whole-request deadline of a request that sends a body, since that transport
+    /// bounds no write.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use s3::bucket::Bucket;
+    /// # use s3::creds::Credentials;
+    /// # use s3::error::S3Error;
+    /// # use std::time::Duration;
+    /// # fn example() -> Result<(), S3Error> {
+    /// let mut bucket = *Bucket::new("my-bucket", "us-east-1".parse()?, Credentials::default()?)?;
+    /// bucket.set_request_timeout(Some(Duration::from_secs(300)));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn set_request_timeout(&mut self, timeout: Option<Duration>) {
         self.request_timeout = timeout;
     }
@@ -4181,7 +4132,16 @@ mod test {
                 }
                 match stream.read_exact(&mut byte) {
                     Ok(()) => raw_headers.push(byte[0]),
-                    Err(_) if raw_headers.is_empty() => return Ok(None),
+                    Err(error)
+                        if raw_headers.is_empty()
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) =>
+                    {
+                        return Ok(None);
+                    }
                     Err(error) => return Err(format!("read headers: {error}")),
                 }
             }
@@ -4329,26 +4289,13 @@ mod test {
                 requests.push(request);
             }
 
-            // The operation signals only after returning, so this also catches
-            // an unexpected extra request without a timing-based sleep.
+            // The operation signals only after returning, so this also catches an unexpected
+            // extra request without a timing-based sleep. A connection without a request is a
+            // part the client gave up on, and does not end the watch.
+            let mut done = false;
             loop {
-                if done_rx.try_recv().is_ok() {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            stream
-                                .set_nonblocking(false)
-                                .map_err(|error| error.to_string())?;
-                            stream
-                                .set_read_timeout(Some(Duration::from_secs(4)))
-                                .map_err(|error| error.to_string())?;
-                            requests.extend(read_request(&mut stream, deadline)?);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(error) => return Err(format!("final accept check: {error}")),
-                    }
-                    return Ok(requests);
-                }
-                if Instant::now() >= deadline {
+                done |= done_rx.try_recv().is_ok();
+                if !done && Instant::now() >= deadline {
                     return Err(format!(
                         "operation completion deadline after {} requests",
                         requests.len()
@@ -4362,10 +4309,15 @@ mod test {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(4)))
                             .map_err(|error| error.to_string())?;
-                        requests.extend(read_request(&mut stream, deadline)?);
-                        return Ok(requests);
+                        if let Some(request) = read_request(&mut stream, deadline)? {
+                            requests.push(request);
+                            return Ok(requests);
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if done {
+                            return Ok(requests);
+                        }
                         thread::sleep(Duration::from_millis(5));
                     }
                     Err(error) => return Err(format!("accept extra request: {error}")),
@@ -5113,7 +5065,16 @@ mod test {
                 }
                 match stream.read_exact(&mut byte) {
                     Ok(()) => header_bytes.push(byte[0]),
-                    Err(_) if header_bytes.is_empty() => return Ok(None),
+                    Err(error)
+                        if header_bytes.is_empty()
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) =>
+                    {
+                        return Ok(None);
+                    }
                     Err(error) => {
                         return Err(format!("read headers at {request_index}: {error}"));
                     }
