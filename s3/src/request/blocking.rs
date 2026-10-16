@@ -7,7 +7,7 @@ use std::io;
 use std::io::Write;
 use std::sync::OnceLock;
 
-use attohttpc::header::{ACCEPT_ENCODING, CONTENT_ENCODING, HeaderName};
+use attohttpc::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HeaderName};
 
 use crate::bucket::Bucket;
 use crate::command::Command;
@@ -52,7 +52,7 @@ fn session(request: &AttoRequest<'_>) -> Result<attohttpc::Session, S3Error> {
 /// `compress-zlib-ng`), and nothing can switch that off. The same features make a default
 /// request advertise `Accept-Encoding`, which is what this looks for: all hang off attohttpc's
 /// `flate2` dependency.
-fn attohttpc_decodes_bodies() -> bool {
+pub(crate) fn attohttpc_decodes_bodies() -> bool {
     static DECODES: OnceLock<bool> = OnceLock::new();
     *DECODES.get_or_init(|| {
         attohttpc::RequestBuilder::new(attohttpc::Method::GET, "http://localhost/")
@@ -62,17 +62,11 @@ fn attohttpc_decodes_bodies() -> bool {
     })
 }
 
-/// The `Content-Encoding` of `response` if it is a successful download of an object's bytes,
-/// a `GetObject` or `GetObjectRange`, that attohttpc decoded on the way in, which per
-/// [`attohttpc_decodes_bodies`] it does to a gzip or deflate one. Any other body is XML, or is
-/// discarded, and decoding it did no harm. attohttpc also decodes a gzip or deflate
-/// `Transfer-Encoding`, which it then strips from the headers; S3 never sends one.
-fn decoded_encoding(request: &AttoRequest<'_>, response: &attohttpc::Response) -> Option<String> {
-    let download = matches!(
-        request.command,
-        Command::GetObject | Command::GetObjectRange { .. }
-    );
-    if !download || !response.status().is_success() || !attohttpc_decodes_bodies() {
+/// The `Content-Encoding` of `response` if attohttpc decoded its body on the way in, which per
+/// [`attohttpc_decodes_bodies`] it does to a gzip or deflate one. attohttpc also decodes a gzip
+/// or deflate `Transfer-Encoding`, which it then strips from the headers; S3 never sends one.
+fn decoded_encoding(response: &attohttpc::Response) -> Option<String> {
+    if !attohttpc_decodes_bodies() {
         return None;
     }
     let encodings: Vec<&str> = response
@@ -87,6 +81,22 @@ fn decoded_encoding(request: &AttoRequest<'_>, response: &attohttpc::Response) -
         .map(str::trim)
         .any(|item| item.eq_ignore_ascii_case("gzip") || item.eq_ignore_ascii_case("deflate"));
     decoded.then(|| encodings.join(", "))
+}
+
+/// The encoding attohttpc decoded `response`'s body from, if `response` is a successful
+/// download of an object's bytes, a `GetObject` or `GetObjectRange`: the stored bytes are then
+/// gone. Any other body is XML, or is discarded, and decoding it did no harm.
+fn decoded_download_encoding(
+    request: &AttoRequest<'_>,
+    response: &attohttpc::Response,
+) -> Option<String> {
+    let download = matches!(
+        request.command,
+        Command::GetObject | Command::GetObjectRange { .. }
+    );
+    (download && response.status().is_success())
+        .then(|| decoded_encoding(response))
+        .flatten()
 }
 
 /// Sends `request` once, through [`session`], to its URL with its body, and returns whatever
@@ -117,18 +127,24 @@ fn atto_response_attempt(
             .map_err(|error| RequestAttemptError::do_not_retry(S3Error::Atto(error)))?;
         return Err(S3Error::HttpFailWithBody(status, body).into());
     }
-    match decoded_encoding(request, &response) {
+    match decoded_download_encoding(request, &response) {
         Some(encoding) => Err(S3Error::AttoDecodedBody(encoding).into()),
         None => Ok(response),
     }
 }
 
 /// The number of body bytes `response`, the reply to a request with `verb`, must deliver, when
-/// it announced them (see `expected_body_length`). attohttpc has validated the `Content-Length`.
+/// it announced them (see `expected_body_length`). A body attohttpc decoded is not held to it:
+/// the bytes read are not the bytes announced. A response that sends both `Transfer-Encoding`
+/// and `Content-Length`, which RFC 9112 forbids, is held to the latter: attohttpc frames its
+/// body by the former but removes it from the headers seen here.
 fn announced_body_length(response: &attohttpc::Response, verb: HttpMethod) -> Option<u64> {
+    if decoded_encoding(response).is_some() {
+        return None;
+    }
     let content_length = response
         .headers()
-        .get(attohttpc::header::CONTENT_LENGTH)
+        .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.parse().ok());
     expected_body_length(verb, response.status().as_u16(), content_length)
 }
@@ -513,72 +529,5 @@ mod tests {
         assert!(signed_headers.contains("content-type"));
 
         Ok(())
-    }
-
-    /// Serves one connection on its own thread: reads the request head, writes `response`, and
-    /// closes, as a server that dies mid-body does.
-    fn serve_once(response: Vec<u8>) -> String {
-        use std::io::{Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            let (mut connection, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                assert_ne!(
-                    connection.read(&mut byte).unwrap(),
-                    0,
-                    "client closed early"
-                );
-                request.push(byte[0]);
-            }
-            connection.write_all(&response).unwrap();
-        });
-        endpoint
-    }
-
-    /// A 200 response announcing a 100-byte body, of which the first `sent` bytes follow.
-    fn response_of_100_bytes_sending(sent: usize) -> Vec<u8> {
-        let mut response =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".to_vec();
-        response.resize(response.len() + sent, b'x');
-        response
-    }
-
-    /// A path-style bucket at `endpoint` whose requests fail rather than hang.
-    fn local_bucket(endpoint: String) -> Box<Bucket> {
-        let region = crate::region::Region::Custom {
-            region: "test-region".to_owned(),
-            endpoint,
-        };
-        let mut bucket = Bucket::new("test-bucket", region, fake_credentials())
-            .unwrap()
-            .with_path_style();
-        bucket.set_request_timeout(Some(std::time::Duration::from_secs(5)));
-        bucket
-    }
-
-    fn is_unexpected_eof(error: &S3Error) -> bool {
-        matches!(error, S3Error::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof)
-    }
-
-    #[test]
-    fn body_cut_short_of_its_content_length_is_an_unexpected_eof() {
-        let bucket = local_bucket(serve_once(response_of_100_bytes_sending(50)));
-        let error = bucket.get_object("/object").unwrap_err();
-        assert!(is_unexpected_eof(&error), "{error}");
-
-        let bucket = local_bucket(serve_once(response_of_100_bytes_sending(50)));
-        let mut writer = Vec::new();
-        let error = bucket
-            .get_object_to_writer("/object", &mut writer)
-            .unwrap_err();
-        assert!(is_unexpected_eof(&error), "{error}");
-        assert_eq!(writer.len(), 50, "the bytes that arrived reach the writer");
-
-        let bucket = local_bucket(serve_once(response_of_100_bytes_sending(100)));
-        assert_eq!(bucket.get_object("/object").unwrap().bytes().len(), 100);
     }
 }

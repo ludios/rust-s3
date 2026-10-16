@@ -112,22 +112,29 @@ async fn send_with_timeout(
     Ok(apply_body_timeout(response, limit))
 }
 
-/// Rewraps the body of `response` in an `IdleReader`, keeping its length and MIME type, so
-/// that every way of reading it is bounded, the raw `surf::Response` included.
+/// Replaces the body of `response` with `wrap(body)`, keeping its length and MIME type.
+fn wrap_body<R>(response: &mut surf::Response, wrap: impl FnOnce(surf::http::Body) -> R)
+where
+    R: async_std::io::Read + Unpin + Send + Sync + 'static,
+{
+    let length = response.len();
+    let body = response.take_body();
+    let mime = body.mime().clone();
+    let mut wrapped =
+        surf::http::Body::from_reader(async_std::io::BufReader::new(wrap(body)), length);
+    wrapped.set_mime(mime);
+    response.set_body(wrapped);
+}
+
+/// Rewraps the body of `response` in an `IdleReader`, so that every way of reading it is
+/// bounded, the raw `surf::Response` included.
 fn apply_body_timeout(mut response: surf::Response, limit: Option<Duration>) -> surf::Response {
     if let Some(limit) = limit {
-        let length = response.len();
-        let body = response.take_body();
-        let mime = body.mime().clone();
-        let reader = IdleReader {
+        wrap_body(&mut response, |body| IdleReader {
             body,
             limit,
             timer: None,
-        };
-        let mut wrapped =
-            surf::http::Body::from_reader(async_std::io::BufReader::new(reader), length);
-        wrapped.set_mime(mime);
-        response.set_body(wrapped);
+        });
     }
     response
 }
@@ -158,26 +165,29 @@ impl async_std::io::Read for ExactLengthReader {
 }
 
 /// Rewraps the body of `response`, the reply to a request with `verb`, in an
-/// `ExactLengthReader` when it announced a `Content-Length` it must honor, keeping its length
-/// and MIME type. Surf's H1 client reports a body cut short by its peer as the end of the
-/// body; hyper reports it as an error already.
+/// `ExactLengthReader` when it announced a `Content-Length` it must honor. An empty body
+/// cannot be cut short and is left alone. Surf's H1 client reports a body cut short by its peer
+/// as the end of the body; hyper reports it as an error already.
 fn require_announced_length(response: &mut surf::Response, verb: HttpMethod) {
-    let length = response.len();
+    let announced = response.len().map(|length| length as u64);
     let status = u16::from(response.status());
-    let announced = length.map(|length| length as u64);
-    let Some(expected) = crate::request::expected_body_length(verb, status, announced) else {
-        return;
-    };
-    let body = response.take_body();
-    let mime = body.mime().clone();
-    let reader = ExactLengthReader {
-        body,
-        expected,
-        received: 0,
-    };
-    let mut wrapped = surf::http::Body::from_reader(async_std::io::BufReader::new(reader), length);
-    wrapped.set_mime(mime);
-    response.set_body(wrapped);
+    let expected = crate::request::expected_body_length(verb, status, announced);
+    if let Some(expected) = expected.filter(|&expected| expected > 0) {
+        wrap_body(response, |body| ExactLengthReader {
+            body,
+            expected,
+            received: 0,
+        });
+    }
+}
+
+/// The error of a failed read of a response body: the `io::Error` it failed with, whose kind
+/// callers can act on, when it failed with one; surf's own errors have only their text.
+fn body_read_error(error: surf::Error) -> S3Error {
+    match error.downcast::<io::Error>() {
+        Ok(error) => S3Error::Io(error),
+        Err(error) => S3Error::Surf(error.to_string()),
+    }
 }
 
 async fn surf_response_attempt(
@@ -204,7 +214,7 @@ async fn surf_response_attempt(
     if cfg!(feature = "fail-on-err") && !response.status().is_success() {
         let status = u16::from(response.status());
         let body = response.body_string().await.map_err(|error| {
-            crate::request::RequestAttemptError::do_not_retry(S3Error::Surf(error.to_string()))
+            crate::request::RequestAttemptError::do_not_retry(body_read_error(error))
         })?;
         return Err(S3Error::HttpFailWithBody(status, body).into());
     }
@@ -285,9 +295,7 @@ impl<'a> Request for SurfRequest<'a> {
                 Ok(status)
             } else if cfg!(feature = "fail-on-err") && !response.status().is_success() {
                 let body = response.body_string().await.map_err(|error| {
-                    crate::request::RequestAttemptError::do_not_retry(S3Error::Surf(
-                        error.to_string(),
-                    ))
+                    crate::request::RequestAttemptError::do_not_retry(body_read_error(error))
                 })?;
                 Err(S3Error::HttpFailWithBody(status, body).into())
             } else {
@@ -327,11 +335,7 @@ impl<'a> Request for SurfRequest<'a> {
                 Bytes::from("")
             }
         } else {
-            let body = match response.body_bytes().await {
-                Ok(bytes) => Ok(Bytes::from(bytes)),
-                Err(e) => Err(S3Error::Surf(e.to_string())),
-            };
-            body?
+            Bytes::from(response.body_bytes().await.map_err(body_read_error)?)
         };
         Ok(ResponseData::new(
             body_vec,
@@ -832,7 +836,10 @@ mod tests {
         .unwrap();
         assert!(request_line.starts_with("GET "));
         if cfg!(feature = "fail-on-err") {
-            assert!(matches!(result, Err(crate::error::S3Error::Surf(_))));
+            assert!(matches!(
+                result,
+                Err(crate::error::S3Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut
+            ));
         } else {
             assert_eq!(result.unwrap(), 403);
         }
@@ -1239,95 +1246,5 @@ mod tests {
         assert!(signed_headers.contains("content-type"));
 
         Ok(())
-    }
-
-    /// Serves one connection: reads the request head, writes `response`, and closes, as a
-    /// server that dies mid-body does.
-    async fn serve_once(response: Vec<u8>) -> String {
-        use async_std::io::{ReadExt, WriteExt};
-
-        let listener = async_std::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        async_std::task::spawn(async move {
-            let (mut connection, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                let read = connection.read(&mut byte).await.unwrap();
-                assert_ne!(read, 0, "client closed early");
-                request.push(byte[0]);
-            }
-            connection.write_all(&response).await.unwrap();
-        });
-        endpoint
-    }
-
-    /// A 200 response announcing a 100-byte body, of which the first `sent` bytes follow.
-    fn response_of_100_bytes_sending(sent: usize) -> Vec<u8> {
-        let mut response =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".to_vec();
-        response.resize(response.len() + sent, b'x');
-        response
-    }
-
-    /// Whether `error` reports a body that ended before its announced length. Under surf's H1
-    /// client that is this backend's `UnexpectedEof`; under hyper, which reports it before this
-    /// backend can, it is hyper's own error, worded differently by each way of reading.
-    fn reports_truncated_body(error: &crate::error::S3Error) -> bool {
-        use crate::error::S3Error;
-        let h1_client = cfg!(any(
-            feature = "async-std-native-tls",
-            feature = "async-std-rustls-tls"
-        ));
-        match error {
-            S3Error::Io(error) => !h1_client || error.kind() == std::io::ErrorKind::UnexpectedEof,
-            S3Error::Surf(message) => !h1_client || message.contains("bytes it announced"),
-            _ => false,
-        }
-    }
-
-    #[async_std::test]
-    async fn body_cut_short_of_its_content_length_is_an_error() {
-        use futures_util::StreamExt;
-
-        let timeout = Some(std::time::Duration::from_secs(5));
-        let bucket = timeout_bucket(serve_once(response_of_100_bytes_sending(50)).await, timeout);
-        let error = bucket.get_object("/object").await.unwrap_err();
-        assert!(reports_truncated_body(&error), "{error}");
-
-        let bucket = timeout_bucket(serve_once(response_of_100_bytes_sending(50)).await, timeout);
-        let mut writer = Vec::new();
-        let error = bucket
-            .get_object_to_writer("/object", &mut writer)
-            .await
-            .unwrap_err();
-        assert!(reports_truncated_body(&error), "{error}");
-        assert_eq!(writer.len(), 50, "the bytes that arrived reach the writer");
-
-        let bucket = timeout_bucket(serve_once(response_of_100_bytes_sending(50)).await, timeout);
-        let mut stream = bucket.get_object_stream("/object").await.unwrap();
-        let mut read = 0;
-        let error = loop {
-            match stream
-                .bytes()
-                .next()
-                .await
-                .expect("the stream ends with an error")
-            {
-                Ok(chunk) => read += chunk.len(),
-                Err(error) => break error,
-            }
-        };
-        assert_eq!(read, 50, "the bytes that arrived are streamed");
-        assert!(reports_truncated_body(&error), "{error}");
-
-        let bucket = timeout_bucket(
-            serve_once(response_of_100_bytes_sending(100)).await,
-            timeout,
-        );
-        let complete = bucket.get_object("/object").await.unwrap();
-        assert_eq!(complete.bytes().len(), 100);
     }
 }

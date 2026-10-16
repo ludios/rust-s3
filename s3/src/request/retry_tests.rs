@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 //! Wire-level regression tests for request retry behavior.
 
 use std::io::{Read, Write};
@@ -30,9 +32,23 @@ struct CapturedRequest {
     body: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
 enum Reply {
-    Response { status: u16, body: &'static [u8] },
-    MalformedChunkedResponse { status: u16, body: &'static [u8] },
+    Response {
+        status: u16,
+        body: &'static [u8],
+    },
+    /// A 200 response with `headers` whose `Content-Length` is `announced` whatever the length
+    /// of `body`: a shorter `body` is one cut short by the connection closing.
+    Announcing {
+        announced: usize,
+        headers: &'static str,
+        body: &'static [u8],
+    },
+    MalformedChunkedResponse {
+        status: u16,
+        body: &'static [u8],
+    },
     Close,
 }
 
@@ -93,6 +109,19 @@ fn start_server(replies: Vec<Reply>) -> MockServer {
                         .write_all(response.as_bytes())
                         .and_then(|()| stream.write_all(body))
                         .map_err(|error| format!("write mock response: {error}"))?;
+                }
+                Reply::Announcing {
+                    announced,
+                    headers,
+                    body,
+                } => {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {announced}\r\nConnection: close\r\n{headers}\r\n"
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .and_then(|()| stream.write_all(body))
+                        .map_err(|error| format!("write announcing response: {error}"))?;
                 }
                 Reply::MalformedChunkedResponse { status, body } => {
                     let response = format!(
@@ -532,7 +561,130 @@ async fn request_retry_permanent_error_body_read_failure_is_not_replayed() {
     #[cfg(feature = "with-tokio")]
     assert!(matches!(result, Err(S3Error::Reqwest(_))));
     #[cfg(feature = "with-async-std")]
-    assert!(matches!(result, Err(S3Error::Surf(_))));
+    assert!(matches!(result, Err(S3Error::Io(_))));
     #[cfg(feature = "sync")]
     assert!(matches!(result, Err(S3Error::Atto(_))));
+}
+
+/// Whether `error`, or an error in its source chain, mentions `needle`.
+fn mentions(error: &dyn std::error::Error, needle: &str) -> bool {
+    error.to_string().contains(needle)
+        || error
+            .source()
+            .is_some_and(|source| mentions(source, needle))
+}
+
+/// Asserts that `error` is this backend's report of a body cut short of its announced length:
+/// an `UnexpectedEof` where the backend counts the bytes itself (sync, async-std's H1 client),
+/// hyper's own report where hyper is the client (tokio's reqwest, async-std's hyper client).
+fn assert_truncated_body(error: S3Error) {
+    let sync = cfg!(feature = "sync");
+    let tokio = !sync && cfg!(feature = "with-tokio");
+    let h1 = !sync
+        && !tokio
+        && cfg!(any(
+            feature = "async-std-native-tls",
+            feature = "async-std-rustls-tls"
+        ));
+    match &error {
+        S3Error::Io(io) if sync || h1 => {
+            assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof, "{error}")
+        }
+        #[cfg(feature = "with-tokio")]
+        S3Error::Reqwest(reqwest) if tokio => assert!(reqwest.is_decode(), "{error}"),
+        S3Error::Io(io) if !sync && !tokio => assert!(mentions(io, "message length"), "{error}"),
+        _ => panic!("not a report of a cut-short body: {error}"),
+    }
+}
+
+#[maybe_async::test(
+    feature = "sync",
+    async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
+    async(
+        all(not(feature = "sync"), feature = "with-async-std"),
+        async_std::test
+    )
+)]
+async fn request_retry_body_cut_short_of_its_content_length_is_an_error_and_not_replayed() {
+    let cut_short = Reply::Announcing {
+        announced: 100,
+        headers: "",
+        body: &[b'x'; 50],
+    };
+
+    let server = start_server(vec![cut_short]);
+    let bucket = test_bucket(server.endpoint.clone()).await;
+    let request = make_request(&bucket, Command::GetObject).await.unwrap();
+    let result = request.response_data(false).await;
+    let requests = server.finish().expect("mock server should finish");
+    assert_eq!(requests.len(), 1, "a cut-short body is not replayed");
+    assert_truncated_body(result.err().expect("a cut-short body is an error"));
+
+    let server = start_server(vec![cut_short]);
+    let bucket = test_bucket(server.endpoint.clone()).await;
+    let request = make_request(&bucket, Command::GetObject).await.unwrap();
+    let mut writer = Vec::new();
+    let result = request.response_data_to_writer(&mut writer).await;
+    let requests = server.finish().expect("mock server should finish");
+    assert_eq!(requests.len(), 1, "a cut-short body is not replayed");
+    assert_truncated_body(result.err().expect("a cut-short body is an error"));
+    assert_eq!(writer.len(), 50, "the bytes that arrived reach the writer");
+
+    #[cfg(not(feature = "sync"))]
+    {
+        use futures_util::StreamExt;
+
+        let server = start_server(vec![cut_short]);
+        let bucket = test_bucket(server.endpoint.clone()).await;
+        let request = make_request(&bucket, Command::GetObject).await.unwrap();
+        let mut stream = request.response_data_to_stream().await.unwrap();
+        let mut read = 0;
+        let error = loop {
+            match stream
+                .bytes()
+                .next()
+                .await
+                .expect("the stream ends with an error")
+            {
+                Ok(chunk) => read += chunk.len(),
+                Err(error) => break error,
+            }
+        };
+        let requests = server.finish().expect("mock server should finish");
+        assert_eq!(requests.len(), 1, "a cut-short body is not replayed");
+        assert_eq!(read, 50, "the bytes that arrived are streamed");
+        assert_truncated_body(error);
+    }
+
+    let complete = Reply::Announcing {
+        announced: 100,
+        headers: "",
+        body: &[b'x'; 100],
+    };
+    let server = start_server(vec![complete]);
+    let bucket = test_bucket(server.endpoint.clone()).await;
+    let request = make_request(&bucket, Command::GetObject).await.unwrap();
+    let response = request.response_data(false).await.unwrap();
+    server.finish().expect("mock server should finish");
+    assert_eq!(response.bytes().len(), 100);
+}
+
+/// An encoded body is held to its `Content-Length` like any other unless attohttpc decoded it,
+/// which the attohttpc of this build does not.
+#[cfg(feature = "sync")]
+#[test]
+fn request_retry_encoded_body_is_held_to_its_content_length_unless_decoded() {
+    assert!(!crate::request::blocking::attohttpc_decodes_bodies());
+    let encoded = Reply::Announcing {
+        announced: 100,
+        headers: "Content-Encoding: gzip\r\n",
+        body: &[b'x'; 50],
+    };
+    let server = start_server(vec![encoded]);
+    let bucket = test_bucket(server.endpoint.clone());
+    let request = make_request(&bucket, Command::GetObject).unwrap();
+    let result = request.response_data(false);
+    let requests = server.finish().expect("mock server should finish");
+    assert_eq!(requests.len(), 1, "a cut-short body is not replayed");
+    assert_truncated_body(result.err().expect("a cut-short body is an error"));
 }
