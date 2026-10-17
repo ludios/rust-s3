@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 mod time_utils;
 
@@ -46,6 +47,11 @@ impl PutStreamResponse {
     }
 }
 
+/// The ETag, unquoted, that `put_object_stream` gives the file at `path`: the hex MD5 of its
+/// bytes when it is shorter than `CHUNK_SIZE` and goes up in one PUT, otherwise the hex MD5 of
+/// its `CHUNK_SIZE`-long parts' MD5s, then `-` and the part count. A file of an exact multiple
+/// of `CHUNK_SIZE` ends with a full part.
+///
 /// # Example
 /// ```rust,no_run
 /// use s3::utils::etag_for_path;
@@ -56,25 +62,23 @@ impl PutStreamResponse {
 /// ```
 pub fn etag_for_path(path: impl AsRef<Path>) -> Result<String, S3Error> {
     let mut file = File::open(path)?;
-    let mut last_digest: [u8; 16];
     let mut digests = Vec::new();
-    let mut chunks = 0;
+    let mut parts = 0;
     loop {
         let chunk = read_chunk(&mut file)?;
-        last_digest = md5::compute(&chunk).into();
-        digests.extend_from_slice(&last_digest);
-        chunks += 1;
+        if parts == 0 && chunk.len() < CHUNK_SIZE {
+            return Ok(format!("{:x}", md5::compute(&chunk)));
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        digests.extend_from_slice(&md5::compute(&chunk).0);
+        parts += 1;
         if chunk.len() < CHUNK_SIZE {
             break;
         }
     }
-    let etag = if chunks <= 1 {
-        format!("{:x}", md5::Digest(last_digest))
-    } else {
-        let digest = format!("{:x}", md5::compute(digests));
-        format!("{}-{}", digest, chunks)
-    };
-    Ok(etag)
+    Ok(format!("{:x}-{parts}", md5::compute(digests)))
 }
 
 pub fn read_chunk<R: Read + ?Sized>(reader: &mut R) -> Result<Vec<u8>, S3Error> {
@@ -471,6 +475,33 @@ mod test {
         std::fs::remove_file(&path).unwrap_or(());
 
         assert_eq!(etag, "e438487f09f09c042b2de097765e5ac2-2");
+    }
+
+    /// The empty file and files of one and two whole chunks: one PUT's ETag for the first,
+    /// and for the others a part count without an empty part after the full ones.
+    #[test]
+    fn test_etag_at_chunk_multiples() {
+        use crate::bucket::CHUNK_SIZE;
+
+        for parts in [0, 1, 2] {
+            let path = etag_test_path(&format!("etag-{parts}-chunks"));
+            let test = object((parts * CHUNK_SIZE) as u32);
+            std::fs::write(&path, &test).unwrap();
+
+            let etag = etag_for_path(&path).unwrap();
+            std::fs::remove_file(&path).unwrap_or(());
+
+            let expected = if parts == 0 {
+                format!("{:x}", md5::compute(b""))
+            } else {
+                let md5s: Vec<u8> = test
+                    .chunks(CHUNK_SIZE)
+                    .flat_map(|part| md5::compute(part).0)
+                    .collect();
+                format!("{:x}-{parts}", md5::compute(md5s))
+            };
+            assert_eq!(etag, expected, "{parts} chunks");
+        }
     }
 
     #[test]
