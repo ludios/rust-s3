@@ -456,6 +456,14 @@ HTTP), cloud-provider compatibility, or cleanup after failure/cancellation.
 Cloud credentials were not loaded for that MinIO run. The later cloud attempts
 are recorded below. The production findings above remain open.
 
+On 2026-10-17 the MinIO tests were removed. `s3/tests/garage.rs` now runs the
+same kinds of checks against a garage server it starts itself, in every
+configuration of `make ci`, plus cleanup after a failing upload source. It
+found three sync defects that the MinIO runs above had passed over: `head_object`
+never returned a content type, a streamed upload under 8 MiB lost its content
+type, and one of an exact multiple of 8 MiB sent an empty last part. Garage has
+no object tagging, so tag readback is now tested only against AWS.
+
 ## Cloud-provider verification attempt
 
 The user subsequently authorized loading the existing `.envrc` credentials.

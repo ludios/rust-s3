@@ -6032,17 +6032,6 @@ mod test {
         .unwrap()
     }
 
-    fn test_minio_credentials() -> Credentials {
-        Credentials::new(
-            Some(&env::var("MINIO_ACCESS_KEY_ID").unwrap()),
-            Some(&env::var("MINIO_SECRET_ACCESS_KEY").unwrap()),
-            None,
-            None,
-            None,
-        )
-        .unwrap()
-    }
-
     fn test_digital_ocean_credentials() -> Credentials {
         Credentials::new(
             Some(&env::var("DIGITAL_OCEAN_ACCESS_KEY_ID").unwrap()),
@@ -6119,19 +6108,6 @@ mod test {
         .unwrap();
         bucket.set_listobjects_v1();
         bucket
-    }
-
-    fn test_minio_bucket() -> Box<Bucket> {
-        Bucket::new(
-            "rust-s3",
-            Region::Custom {
-                region: "us-east-1".to_owned(),
-                endpoint: "http://localhost:9000".to_owned(),
-            },
-            test_minio_credentials(),
-        )
-        .unwrap()
-        .with_path_style()
     }
 
     /// Bucket with hardcoded fake credentials for tests that only exercise
@@ -6320,50 +6296,6 @@ mod test {
     }
 
     #[ignore]
-    #[cfg(feature = "tags")]
-    #[maybe_async::test(
-        feature = "sync",
-        async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
-        async(
-            all(not(feature = "sync"), feature = "with-async-std"),
-            async_std::test
-        )
-    )]
-    async fn test_tagging_minio() {
-        let bucket = test_minio_bucket();
-        let tagging_path = test_object_key("tagging_test");
-        let target_tags = vec![
-            Tag {
-                key: "Tag1".to_string(),
-                value: "Value1".to_string(),
-            },
-            Tag {
-                key: "Tag2".to_string(),
-                value: "Value2".to_string(),
-            },
-        ];
-        let empty_tags: Vec<Tag> = Vec::new();
-        let response_data = bucket
-            .put_object(&tagging_path, b"Gimme tags")
-            .await
-            .unwrap();
-        assert_eq!(response_data.status_code(), 200);
-        let (tags, _code) = bucket.get_object_tagging(&tagging_path).await.unwrap();
-        assert_eq!(tags, empty_tags);
-        let response_data = bucket
-            .put_object_tagging(&tagging_path, &[("Tag1", "Value1"), ("Tag2", "Value2")])
-            .await
-            .unwrap();
-        assert_eq!(response_data.status_code(), 200);
-        let (mut tags, _code) = bucket.get_object_tagging(&tagging_path).await.unwrap();
-        tags.sort_by(|left, right| left.key.cmp(&right.key));
-        let mut target_tags = target_tags;
-        target_tags.sort_by(|left, right| left.key.cmp(&right.key));
-        assert_eq!(tags, target_tags);
-        let _response_data = bucket.delete_object(&tagging_path).await.unwrap();
-    }
-
-    #[ignore]
     #[maybe_async::test(
         feature = "sync",
         async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
@@ -6387,19 +6319,6 @@ mod test {
     )]
     async fn streaming_big_gc_put_head_get_delete_object() {
         streaming_test_put_get_delete_big_object(*test_gc_bucket()).await;
-    }
-
-    #[ignore]
-    #[maybe_async::test(
-        feature = "sync",
-        async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
-        async(
-            all(not(feature = "sync"), feature = "with-async-std"),
-            async_std::test
-        )
-    )]
-    async fn streaming_big_minio_put_head_get_delete_object() {
-        streaming_test_put_get_delete_big_object(*test_minio_bucket()).await;
     }
 
     #[ignore]
@@ -6578,19 +6497,6 @@ mod test {
     )]
     async fn streaming_r2_put_head_get_delete_object() {
         streaming_test_put_get_delete_small_object(test_r2_bucket()).await;
-    }
-
-    #[ignore]
-    #[maybe_async::test(
-        feature = "sync",
-        async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
-        async(
-            all(not(feature = "sync"), feature = "with-async-std"),
-            async_std::test
-        )
-    )]
-    async fn streaming_minio_put_head_get_delete_object() {
-        streaming_test_put_get_delete_small_object(test_minio_bucket()).await;
     }
 
     #[maybe_async::maybe_async]
@@ -6801,16 +6707,6 @@ mod test {
         feature = "blocking"
     ))]
     #[test]
-    fn minio_put_head_get_delete_object_blocking() {
-        put_head_get_list_delete_object_blocking(*test_minio_bucket())
-    }
-
-    #[ignore]
-    #[cfg(all(
-        any(feature = "with-tokio", feature = "with-async-std"),
-        feature = "blocking"
-    ))]
-    #[test]
     fn r2_put_head_get_delete_object_blocking() {
         put_head_get_list_delete_object_blocking(*test_r2_bucket())
     }
@@ -6865,140 +6761,6 @@ mod test {
     async fn wasabi_test_put_head_get_delete_object() {
         put_head_get_delete_object(*test_wasabi_bucket(), true).await;
         put_head_delete_object_with_headers(*test_wasabi_bucket()).await;
-    }
-
-    #[ignore]
-    #[maybe_async::test(
-        feature = "sync",
-        async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
-        async(
-            all(not(feature = "sync"), feature = "with-async-std"),
-            async_std::test
-        )
-    )]
-    async fn minio_test_put_head_get_delete_object() {
-        let bucket = *test_minio_bucket();
-        put_head_get_delete_object(bucket.clone(), true).await;
-        put_head_delete_object_with_headers(bucket.clone()).await;
-
-        let prefix = test_object_key(&format!("+copy_roundtrip_{}", uuid::Uuid::new_v4()));
-        let source = format!("{prefix}_source");
-        let destination = format!("{prefix}_destination");
-        let content = b"MinIO copy object content verification";
-        let copy_result = match bucket.put_object(&source, content).await {
-            Err(error) => Err(error),
-            Ok(_) => match bucket.copy_object_internal(&source, &destination).await {
-                Err(error) => Err(error),
-                Ok(status) => bucket
-                    .get_object(&destination)
-                    .await
-                    .map(|copied| (status, copied.to_vec())),
-            },
-        };
-        let source_cleanup = bucket.delete_object(&source).await;
-        let destination_cleanup = bucket.delete_object(&destination).await;
-
-        assert_eq!(source_cleanup.unwrap().status_code(), 204);
-        assert_eq!(destination_cleanup.unwrap().status_code(), 204);
-        let (status, copied) = copy_result.unwrap();
-        assert_eq!(status, 200);
-        assert_eq!(copied.as_slice(), content);
-    }
-
-    #[ignore]
-    #[maybe_async::test(
-        feature = "sync",
-        async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
-        async(
-            all(not(feature = "sync"), feature = "with-async-std"),
-            async_std::test
-        )
-    )]
-    async fn minio_multipart_upload_pagination_uses_key_and_upload_id_markers() {
-        let bucket = *test_minio_bucket();
-        let key = test_object_key(&format!("multipart-pagination/{}", uuid::Uuid::new_v4()));
-        let mut created_upload_ids = Vec::new();
-        let listing_result =
-            minio_list_multipart_pages(&bucket, &key, &mut created_upload_ids).await;
-
-        let mut cleanup_errors = Vec::new();
-        for upload_id in &created_upload_ids {
-            if let Err(error) = bucket.abort_upload(&key, upload_id).await {
-                cleanup_errors.push(error.to_string());
-            }
-        }
-
-        let listed_ids = listing_result.unwrap_or_else(|primary| {
-            panic!(
-                "MinIO multipart pagination failed: {primary}; cleanup errors: {cleanup_errors:?}"
-            )
-        });
-        assert!(
-            cleanup_errors.is_empty(),
-            "failed to abort test multipart uploads: {cleanup_errors:?}"
-        );
-        assert_eq!(listed_ids.len(), 2);
-    }
-
-    #[maybe_async::maybe_async]
-    async fn minio_list_multipart_pages(
-        bucket: &Bucket,
-        key: &str,
-        created_upload_ids: &mut Vec<String>,
-    ) -> Result<Vec<String>, String> {
-        for _ in 0..2 {
-            let upload = bucket
-                .initiate_multipart_upload(key, "application/octet-stream")
-                .await
-                .map_err(|error| error.to_string())?;
-            created_upload_ids.push(upload.upload_id);
-        }
-
-        let (first_page, first_status) = bucket
-            .list_multiparts_uploads_page(Some(key), None, None, None, Some(1))
-            .await
-            .map_err(|error| error.to_string())?;
-        if first_status != 200 || !first_page.is_truncated || first_page.uploads.len() != 1 {
-            return Err("first MinIO page did not contain one truncated upload".to_owned());
-        }
-        let next_key_marker = first_page
-            .next_marker
-            .clone()
-            .ok_or_else(|| "first MinIO page omitted NextKeyMarker".to_owned())?;
-        let next_upload_id_marker = first_page
-            .next_upload_id_marker
-            .clone()
-            .ok_or_else(|| "first MinIO page omitted NextUploadIdMarker".to_owned())?;
-
-        let (second_page, second_status) = bucket
-            .list_multiparts_uploads_page(
-                Some(key),
-                None,
-                Some(next_key_marker),
-                Some(next_upload_id_marker),
-                Some(1),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        if second_status != 200 || second_page.is_truncated || second_page.uploads.len() != 1 {
-            return Err("second MinIO page did not contain one upload".to_owned());
-        }
-
-        let mut listed_ids = first_page
-            .uploads
-            .iter()
-            .chain(second_page.uploads.iter())
-            .map(|upload| upload.id.clone())
-            .collect::<Vec<_>>();
-        listed_ids.sort();
-        let mut expected_ids = created_upload_ids.clone();
-        expected_ids.sort();
-        if listed_ids != expected_ids {
-            return Err(
-                "MinIO pagination did not return each created upload exactly once".to_owned(),
-            );
-        }
-        Ok(listed_ids)
     }
 
     #[ignore]
@@ -7075,19 +6837,6 @@ mod test {
     )]
     async fn aws_test_delete_objects() {
         put_delete_objects(*test_aws_bucket()).await;
-    }
-
-    #[ignore]
-    #[maybe_async::test(
-        feature = "sync",
-        async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
-        async(
-            all(not(feature = "sync"), feature = "with-async-std"),
-            async_std::test
-        )
-    )]
-    async fn minio_test_delete_objects() {
-        put_delete_objects(*test_minio_bucket()).await;
     }
 
     #[maybe_async::test(

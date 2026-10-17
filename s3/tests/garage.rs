@@ -555,3 +555,94 @@ async fn deletes_remove_objects_and_succeed_for_missing_keys() {
         .collect();
     assert_eq!(listed, ["kept"]);
 }
+
+/// `copy_object_internal` copies an object, from a key that the copy source must
+/// percent-encode, to another key.
+#[maybe_async::test(feature = "sync", async(not(feature = "sync"), async_test))]
+async fn copy_object_internal_copies_the_object() {
+    let garage = GarageServer::start();
+    let bucket = garage.bucket("test");
+    let content = pattern(3000);
+    bucket.put_object(AWKWARD_KEY, &content).await.unwrap();
+
+    let status = bucket
+        .copy_object_internal(AWKWARD_KEY, "/copy")
+        .await
+        .unwrap();
+
+    assert_eq!(status, 200);
+    let copied = bucket.get_object("/copy").await.unwrap();
+    assert!(copied.as_slice() == content);
+}
+
+/// The cache control and metadata headers given to `put_object_with_headers` reach the object.
+#[maybe_async::test(feature = "sync", async(not(feature = "sync"), async_test))]
+async fn put_object_with_headers_stores_cache_control_and_metadata() {
+    let garage = GarageServer::start();
+    let bucket = garage.bucket("test");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("max-age=42"),
+    );
+    headers.insert("x-amz-meta-marker", http::HeaderValue::from_static("put"));
+
+    let put = bucket
+        .put_object_with_headers("/headers", b"content", Some(headers))
+        .await
+        .unwrap();
+
+    assert_eq!(put.status_code(), 200);
+    let (head, _) = bucket.head_object("/headers").await.unwrap();
+    assert_eq!(head.cache_control.as_deref(), Some("max-age=42"));
+    let marker = head
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("marker"));
+    assert_eq!(marker.map(String::as_str), Some("put"));
+}
+
+/// A listing of at most two entries per page resumes from each page's continuation token until
+/// a page is not truncated, and so lists each key under the prefix once; the delimiter rolls
+/// the deeper key up into a common prefix.
+#[maybe_async::test(feature = "sync", async(not(feature = "sync"), async_test))]
+async fn object_listing_pages_by_continuation_token() {
+    let garage = GarageServer::start();
+    let bucket = garage.bucket("test");
+    for path in ["/list/a", "/list/b", "/list/c", "/list/deeper/d", "/other"] {
+        bucket.put_object(path, b"content").await.unwrap();
+    }
+
+    let mut keys = Vec::new();
+    let mut prefixes = Vec::new();
+    let mut token = None;
+    for page_number in 1.. {
+        assert!(page_number <= 4, "the listing did not end after 4 pages");
+        let (page, status) = bucket
+            .list_page(
+                "list/".to_owned(),
+                Some("/".to_owned()),
+                token,
+                None,
+                Some(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        let page_prefixes = page.common_prefixes.unwrap_or_default();
+        let entries = page.contents.len() + page_prefixes.len();
+        assert!(entries <= 2, "page {page_number} has {entries} entries");
+        keys.extend(page.contents.into_iter().map(|object| object.key));
+        prefixes.extend(page_prefixes.into_iter().map(|prefix| prefix.prefix));
+        if !page.is_truncated {
+            break;
+        }
+        token = Some(
+            page.next_continuation_token
+                .expect("a truncated page has no token"),
+        );
+    }
+
+    assert_eq!(keys, ["list/a", "list/b", "list/c"]);
+    assert_eq!(prefixes, ["list/deeper/"]);
+}

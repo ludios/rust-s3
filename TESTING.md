@@ -59,9 +59,11 @@ GitHub workflow installs a pinned release. They cover streamed uploads below,
 at, and above the part length, with the part boundaries checked through the
 multipart ETag; builder headers; the abort after a failing source; manual
 multipart uploads, aborts, and listing pagination; whole, ranged, streamed, and
-writer reads, including a range past the end; and single and bulk deletes,
-partly on a key that needs percent-encoding. Garage accepts parts under 5 MiB,
-so the async configurations upload 256 KiB parts; sync uses its fixed 8 MiB.
+writer reads, including a range past the end; single and bulk deletes; copies;
+headers on a single PUT; and object listing pages, partly on a key that needs
+percent-encoding. Garage accepts parts under 5 MiB, so the async configurations
+upload 256 KiB parts; sync uses its fixed 8 MiB. Garage has no object tagging,
+so tag readback is tested only against AWS.
 
 ## GitHub workflow
 
@@ -74,50 +76,21 @@ configuration and credentials. The repository ignores `Cargo.lock`, so
 CI resolves dependencies at run time and does not promise a fixed dependency
 snapshot across workflow runs.
 
-## Isolated MinIO provider tests
-
-The ignored MinIO tests expect `http://localhost:9000`, an existing bucket named
-`rust-s3`, and `MINIO_ACCESS_KEY_ID` / `MINIO_SECRET_ACCESS_KEY`. Use a disposable
-MinIO instance with its own data and certificate directories, bound to loopback,
-and temporary credentials. Do not point these fixed-name fixtures at a shared
-bucket.
-
-Build the test executable from the repository with
-`cargo test -p rust-s3 --lib --no-run --message-format=json`, adding
-`--no-default-features --features ...` for each configuration. Use the `s3`
-compiler artifact's `executable` path from Cargo's JSON output. Run that executable
-from an empty temporary working directory with arguments
-`minio --ignored --test-threads=1`, inheriting only the intended test configuration.
-The temporary working directory matters: the current multipart fixture creates
-and removes a file named `+stream_test_big` in its working directory.
-
-Run configurations serially because the tests share object names. Enable `tags`
-in each configuration to include tag readback. The native-TLS Tokio and async-std
-configurations can additionally enable `blocking` to exercise the blocking API.
-Afterward, verify that both object and multipart-upload listings are empty, delete
-the test bucket, stop the owned server process, and remove its temporary data.
-
-The 2026-10-02 local run passed against MinIO `RELEASE.2025-10-15T17-29-55Z`:
-five ignored tests in each of nine runtime/TLS feature configurations, plus six
-in each of two native-TLS blocking configurations (57 executions). The tests
-check CRUD, byte ranges, metadata, copied content, bulk deletion, tag readback,
-small streaming uploads, and exact bytes through a 20 MB multipart upload and
-download. Async streaming fixtures also verify builder metadata, cache control,
-and content type through HEAD on both small and multipart uploads. Async configurations also verify every downloaded stream chunk;
-blocking tests include list pagination and deletion status checks.
-
-These are HTTP tests of a real local MinIO server. They do not verify TLS
-handshakes, AWS/R2/GCS/Wasabi behavior, or failure/cancellation cleanup. See
-[AUDIT.md](AUDIT.md) for remaining coverage and production fixes.
-
 ## Cloud object tests
 
 Load only the intended provider credentials into the test process. The existing
 fixtures use source-defined test buckets; review those targets before running.
 Set `RUST_S3_TEST_PREFIX` to a fresh UUID-based prefix ending in `/`, for example
 `rust-s3-audit/<uuid>/tokio/aws/`. Object fixtures prepend it to their keys;
-leaving it unset retains their historical fixed keys. Run the compiled test
-executable from an empty temporary directory, as for MinIO.
+leaving it unset retains their historical fixed keys.
+
+Build the test executable from the repository with
+`cargo test -p rust-s3 --lib --no-run --message-format=json`, adding
+`--no-default-features --features ...` for each configuration, and use the `s3`
+compiler artifact's `executable` path from Cargo's JSON output. Run it from an
+empty temporary working directory, inheriting only the intended test
+configuration: the multipart fixture creates and removes a file named
+`+stream_test_big` in its working directory.
 
 Select exact object tests, for example
 `bucket::test::aws_put_head_get_delete_object --ignored --exact --test-threads=1`.
@@ -146,7 +119,8 @@ verified empty afterward. GCS tests include Tokio rustls. The blocking fixture
 checks exact keys across pages without assuming their order, while retaining
 strict pagination assertions; raw R2 responses exhibited a different ordering.
 
-The full local gate and MinIO matrix also passed. See [AUDIT.md](AUDIT.md) for
+The full local gate and the MinIO tests of the time, since replaced by the
+garage suite, also passed. See [AUDIT.md](AUDIT.md) for
 repairs, historical failures, cleanup evidence, and the remaining limits. This
 matrix covers selected object operations, not bucket configuration, every S3
 API, failure/cancellation cleanup, or performance benchmarks.
