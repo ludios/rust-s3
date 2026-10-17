@@ -85,31 +85,34 @@ pub fn read_chunk<R: Read + ?Sized>(reader: &mut R) -> Result<Vec<u8>, S3Error> 
     Ok(chunk)
 }
 
+/// Up to `chunk_size` bytes of `reader`, fewer only at its end.
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 pub async fn read_chunk_async<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
+    chunk_size: usize,
 ) -> Result<Vec<u8>, S3Error> {
-    let mut chunk = Vec::with_capacity(CHUNK_SIZE);
-    let mut take = reader.take(CHUNK_SIZE as u64);
+    let mut chunk = Vec::with_capacity(chunk_size);
+    let mut take = reader.take(chunk_size as u64);
     take.read_to_end(&mut chunk).await?;
 
     Ok(chunk)
 }
 
-/// The chunks of `reader` as a stream, each `CHUNK_SIZE` long but the last: a short one ends
+/// The chunks of `reader` as a stream, each `chunk_size` long but the last: a short one ends
 /// the stream after it, an empty one at once. Unlike a `read_chunk_async` future, the stream
 /// keeps a partly read chunk when the `next()` polling it is dropped, so a read can be raced
 /// against other work.
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 pub(crate) fn chunk_stream<R: AsyncRead + Unpin + ?Sized>(
     reader: &mut R,
+    chunk_size: usize,
 ) -> impl futures_util::Stream<Item = Result<Vec<u8>, S3Error>> + '_ {
-    futures_util::stream::try_unfold((reader, false), |(reader, done)| async move {
+    futures_util::stream::try_unfold((reader, false), move |(reader, done)| async move {
         if done {
             return Ok(None);
         }
-        let chunk = read_chunk_async(reader).await?;
-        let done = chunk.len() < CHUNK_SIZE;
+        let chunk = read_chunk_async(reader, chunk_size).await?;
+        let done = chunk.len() < chunk_size;
         Ok((!chunk.is_empty()).then_some((chunk, (reader, done))))
     })
 }

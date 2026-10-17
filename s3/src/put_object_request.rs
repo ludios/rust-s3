@@ -1,3 +1,5 @@
+// Model-output: Claude Fable 5.1
+
 //! Builder pattern for S3 PUT operations with customizable options
 //!
 //! This module provides a builder pattern for constructing PUT requests with
@@ -224,6 +226,9 @@ impl<'a> PutObjectRequest<'a> {
 /// controls the generated content type for initiation and parts. Bucket-level
 /// extra headers keep their existing raw behavior and must be valid for every
 /// request made by the multipart upload.
+///
+/// `with_chunk_size` sets the part length and with it the multipart threshold;
+/// `with_max_concurrent_chunks` caps the parts in flight.
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
 #[derive(Debug, Clone)]
 pub struct PutObjectStreamRequest<'a> {
@@ -232,6 +237,7 @@ pub struct PutObjectStreamRequest<'a> {
     content_type: String,
     custom_headers: HeaderMap,
     max_concurrent_chunks: Option<std::num::NonZeroUsize>,
+    chunk_size: Option<std::num::NonZeroUsize>,
 }
 
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
@@ -244,6 +250,7 @@ impl<'a> PutObjectStreamRequest<'a> {
             content_type: "application/octet-stream".to_string(),
             custom_headers: HeaderMap::new(),
             max_concurrent_chunks: None,
+            chunk_size: None,
         }
     }
 
@@ -325,30 +332,22 @@ impl<'a> PutObjectStreamRequest<'a> {
         self
     }
 
-    /// Execute the streaming PUT request
-    #[cfg(feature = "with-tokio")]
-    pub async fn execute_stream<R: AsyncRead + Unpin + ?Sized>(
-        self,
-        reader: &mut R,
-    ) -> Result<crate::utils::PutStreamResponse, S3Error> {
-        // AsyncReadExt trait is not used here
-
-        self.bucket
-            ._put_object_stream_with_content_type_and_headers(
-                reader,
-                &self.path,
-                &self.content_type,
-                if self.custom_headers.is_empty() {
-                    None
-                } else {
-                    Some(self.custom_headers)
-                },
-                self.max_concurrent_chunks,
-            )
-            .await
+    /// Set the length in bytes of every multipart part but the last, and with it the
+    /// multipart threshold: an object shorter than this goes up in one regular PUT, any
+    /// other as a multipart upload. A value of `0` restores the default, `CHUNK_SIZE`
+    /// (8 MiB).
+    ///
+    /// Each part in flight is buffered whole, plus one copy for the request body, so an
+    /// upload holds about twice this length times its concurrency cap; the automatic cap
+    /// shrinks as this grows, down to 2. S3 refuses parts under 5 MiB except the last,
+    /// caps a part at 5 GiB, and allows 10,000 parts, so this length times 10,000 bounds
+    /// an object; other services differ.
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = std::num::NonZeroUsize::new(chunk_size);
+        self
     }
 
-    #[cfg(feature = "with-async-std")]
+    /// Execute the streaming PUT request
     pub async fn execute_stream<R: AsyncRead + Unpin + ?Sized>(
         self,
         reader: &mut R,
@@ -364,6 +363,7 @@ impl<'a> PutObjectStreamRequest<'a> {
                     Some(self.custom_headers)
                 },
                 self.max_concurrent_chunks,
+                self.chunk_size,
             )
             .await
     }
@@ -455,6 +455,32 @@ mod tests {
                 .with_max_concurrent_chunks(32)
                 .with_max_concurrent_chunks(0)
                 .max_concurrent_chunks,
+            None
+        );
+    }
+
+    #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
+    #[test]
+    fn stream_builder_chunk_size_defaults_and_resets_to_default() {
+        let bucket =
+            Bucket::new("test", Region::UsEast1, Credentials::anonymous().unwrap()).unwrap();
+
+        assert_eq!(bucket.put_object_stream_builder("/stream").chunk_size, None);
+        assert_eq!(
+            bucket
+                .put_object_stream_builder("/stream")
+                .with_chunk_size(300_000_000)
+                .chunk_size
+                .unwrap()
+                .get(),
+            300_000_000
+        );
+        assert_eq!(
+            bucket
+                .put_object_stream_builder("/stream")
+                .with_chunk_size(300_000_000)
+                .with_chunk_size(0)
+                .chunk_size,
             None
         );
     }

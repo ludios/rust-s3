@@ -175,6 +175,13 @@ than retained as misleading, costly cap evidence. Peak RSS, throughput, and
 multi-upload budgeting remain unmeasured; add an explicit configuration surface
 only if measurements justify it.
 
+Follow-up: `PutObjectStreamRequest::with_chunk_size` sets the part length per
+upload (a downstream uploads 300 MB parts, so that the 10,000-part cap bounds an
+object at 3 TB rather than 78 GiB), and the heuristic budgets three times the
+configured length per in-flight part, so a long part lowers the automatic fanout,
+down to 2. Callers with long parts should set `with_max_concurrent_chunks`
+themselves; each part in flight costs about twice its length.
+
 The full `make ci` gate passed in 112.72 seconds. Exact existing MinIO large-stream
 tests passed on the final Tokio-native and async-std-native binaries, with
 independent empty and untruncated object/upload listings afterward. These are

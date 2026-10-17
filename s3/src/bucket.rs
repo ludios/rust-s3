@@ -20,7 +20,8 @@
 //!
 //! ## Constants
 //!
-//! - `CHUNK_SIZE`: Defines the chunk size for multipart uploads (8 MiB).
+//! - `CHUNK_SIZE`: The default chunk size for multipart uploads (8 MiB);
+//!   `PutObjectStreamRequest::with_chunk_size` sets one per upload.
 //! - `DEFAULT_REQUEST_TIMEOUT`: The default `request_timeout` (60 seconds of inactivity).
 //!
 //! ## Types
@@ -2078,15 +2079,17 @@ impl Bucket {
             content_type,
             None,
             None,
+            None,
         )
         .await
     }
 
-    /// Calculate the maximum number of concurrent chunks based on available memory.
+    /// Calculate the maximum number of concurrent chunks of `chunk_size` bytes each based on
+    /// available memory, budgeting three times a chunk per chunk in flight.
     /// Returns a per-upload count between 2 and 10, defaulting to 3 if detection fails.
     /// This sizing input is not a process-wide memory or RSS limit.
     #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
-    fn max_concurrent_chunks_for_memory(available_memory: u64) -> usize {
+    fn max_concurrent_chunks_for_memory(available_memory: u64, chunk_size: usize) -> usize {
         const DEFAULT_CONCURRENT_CHUNKS: usize = 3;
         const MAX_CONCURRENT_CHUNKS: usize = 10;
 
@@ -2094,12 +2097,12 @@ impl Bucket {
             return DEFAULT_CONCURRENT_CHUNKS;
         }
 
-        let memory_per_chunk = CHUNK_SIZE as u64 * 3;
+        let memory_per_chunk = (chunk_size as u64).saturating_mul(3);
         (available_memory / memory_per_chunk).clamp(2, MAX_CONCURRENT_CHUNKS as u64) as usize
     }
 
     #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
-    fn calculate_max_concurrent_chunks() -> usize {
+    fn calculate_max_concurrent_chunks(chunk_size: usize) -> usize {
         // Create a new System instance and refresh memory info
         let mut system = System::new();
         system.refresh_memory_specifics(MemoryRefreshKind::everything());
@@ -2107,9 +2110,14 @@ impl Bucket {
         // Get available memory in bytes
         let available_memory = system.available_memory();
 
-        Self::max_concurrent_chunks_for_memory(available_memory)
+        Self::max_concurrent_chunks_for_memory(available_memory, chunk_size)
     }
 
+    /// Upload `reader` to `s3_path` with `content_type`: in one PUT when it is shorter than a
+    /// chunk, otherwise as a multipart upload of chunk-long parts but the last. `custom_headers`
+    /// are routed per request as `PutObjectStreamRequest` documents. `max_concurrent_chunks`
+    /// caps the parts in flight, by default 2–10 from available memory; `chunk_size` is the
+    /// part length, by default `CHUNK_SIZE`.
     #[maybe_async::async_impl]
     pub(crate) async fn _put_object_stream_with_content_type_and_headers<
         R: AsyncRead + Unpin + ?Sized,
@@ -2120,12 +2128,11 @@ impl Bucket {
         content_type: &str,
         custom_headers: Option<http::HeaderMap>,
         max_concurrent_chunks: Option<std::num::NonZeroUsize>,
+        chunk_size: Option<std::num::NonZeroUsize>,
     ) -> Result<PutStreamResponse, S3Error> {
-        // If the file is smaller CHUNK_SIZE, just do a regular upload.
-        // Otherwise perform a multi-part upload.
-        let first_chunk = crate::utils::read_chunk_async(reader).await?;
-        // println!("First chunk size: {}", first_chunk.len());
-        if first_chunk.len() < CHUNK_SIZE {
+        let chunk_size = chunk_size.map_or(CHUNK_SIZE, std::num::NonZeroUsize::get);
+        let first_chunk = crate::utils::read_chunk_async(reader, chunk_size).await?;
+        if first_chunk.len() < chunk_size {
             let total_size = first_chunk.len();
             // Use the builder pattern for small files
             let mut builder = self
@@ -2159,7 +2166,7 @@ impl Bucket {
 
         // Determine max concurrent chunks based on available memory
         let max_concurrent_chunks = max_concurrent_chunks.map_or_else(
-            Self::calculate_max_concurrent_chunks,
+            || Self::calculate_max_concurrent_chunks(chunk_size),
             std::num::NonZeroUsize::get,
         );
 
@@ -2191,7 +2198,7 @@ impl Bucket {
             {
                 let mut parts = std::pin::pin!(
                     stream::once(async { Ok(first_chunk) })
-                        .chain(crate::utils::chunk_stream(reader))
+                        .chain(crate::utils::chunk_stream(reader, chunk_size))
                         .map_ok(|chunk| {
                             part_number += 1;
                             total_size += chunk.len();
@@ -3763,12 +3770,38 @@ mod test {
     #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
     #[test]
     fn concurrent_chunk_calculation_is_bounded_and_has_a_fallback() {
-        let per_chunk = super::CHUNK_SIZE as u64 * 3;
-        assert_eq!(Bucket::max_concurrent_chunks_for_memory(0), 3);
-        assert_eq!(Bucket::max_concurrent_chunks_for_memory(per_chunk - 1), 2);
-        assert_eq!(Bucket::max_concurrent_chunks_for_memory(per_chunk * 9), 9);
-        assert_eq!(Bucket::max_concurrent_chunks_for_memory(per_chunk * 10), 10);
-        assert_eq!(Bucket::max_concurrent_chunks_for_memory(u64::MAX), 10);
+        use super::CHUNK_SIZE;
+        let per_chunk = CHUNK_SIZE as u64 * 3;
+        assert_eq!(Bucket::max_concurrent_chunks_for_memory(0, CHUNK_SIZE), 3);
+        assert_eq!(
+            Bucket::max_concurrent_chunks_for_memory(per_chunk - 1, CHUNK_SIZE),
+            2
+        );
+        assert_eq!(
+            Bucket::max_concurrent_chunks_for_memory(per_chunk * 9, CHUNK_SIZE),
+            9
+        );
+        assert_eq!(
+            Bucket::max_concurrent_chunks_for_memory(per_chunk * 10, CHUNK_SIZE),
+            10
+        );
+        assert_eq!(
+            Bucket::max_concurrent_chunks_for_memory(u64::MAX, CHUNK_SIZE),
+            10
+        );
+        // A longer chunk is budgeted proportionally, down to the minimum of 2.
+        assert_eq!(
+            Bucket::max_concurrent_chunks_for_memory(per_chunk * 10, 2 * CHUNK_SIZE),
+            5
+        );
+        assert_eq!(
+            Bucket::max_concurrent_chunks_for_memory(per_chunk * 10, 10 * CHUNK_SIZE),
+            2
+        );
+        assert_eq!(
+            Bucket::max_concurrent_chunks_for_memory(per_chunk * 10, usize::MAX),
+            2
+        );
     }
 
     fn test_object_key(suffix: &str) -> String {
@@ -4089,6 +4122,9 @@ mod test {
         content_length: usize,
     }
 
+    /// Stream `size` bytes to a local HTTP server as `chunk_size`-long parts with
+    /// `custom_headers`, the reader failing at its end when `fail_reader`; returns the
+    /// operation's result and the requests the server saw, in order.
     #[cfg(all(
         not(feature = "sync"),
         any(feature = "with-tokio", feature = "with-async-std")
@@ -4098,6 +4134,7 @@ mod test {
         size: usize,
         fail_reader: bool,
         custom_headers: HeaderMap,
+        chunk_size: usize,
     ) -> (
         Result<(), S3Error>,
         Result<Vec<MultipartWireRequest>, String>,
@@ -4113,6 +4150,7 @@ mod test {
         fn read_request(
             stream: &mut std::net::TcpStream,
             deadline: Instant,
+            body_cap: usize,
         ) -> Result<Option<MultipartWireRequest>, String> {
             let mut raw_headers = Vec::new();
             let mut byte = [0u8; 1];
@@ -4152,7 +4190,7 @@ mod test {
                 .get("content-length")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(0);
-            if content_length > super::CHUNK_SIZE + 16 * 1024 {
+            if content_length > body_cap {
                 return Err("request body exceeded test cap".to_owned());
             }
             let mut body = vec![0; content_length];
@@ -4184,16 +4222,17 @@ mod test {
                 Vec::new()
             } else if fail_reader {
                 vec!["init", "abort"]
-            } else if size < super::CHUNK_SIZE {
+            } else if size < chunk_size {
                 vec!["put"]
             } else {
-                let part_count = size.div_ceil(super::CHUNK_SIZE);
+                let part_count = size.div_ceil(chunk_size);
                 let mut steps = vec!["init"];
                 steps.extend(std::iter::repeat_n("part", part_count));
                 steps.push("complete");
                 steps
             };
 
+            let body_cap = chunk_size + 16 * 1024;
             let deadline = Instant::now() + Duration::from_secs(12);
             let mut requests = Vec::new();
             for step in expected {
@@ -4222,7 +4261,7 @@ mod test {
                     stream
                         .set_write_timeout(Some(Duration::from_secs(4)))
                         .map_err(|error| error.to_string())?;
-                    if let Some(request) = read_request(&mut stream, deadline)? {
+                    if let Some(request) = read_request(&mut stream, deadline, body_cap)? {
                         break (stream, request);
                     }
                 };
@@ -4299,7 +4338,7 @@ mod test {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(4)))
                             .map_err(|error| error.to_string())?;
-                        if let Some(request) = read_request(&mut stream, deadline)? {
+                        if let Some(request) = read_request(&mut stream, deadline, body_cap)? {
                             requests.push(request);
                             return Ok(requests);
                         }
@@ -4344,6 +4383,7 @@ mod test {
             .put_object_stream_builder("/multipart-header-test")
             .with_content_type("text/plain")
             .with_headers(custom_headers)
+            .with_chunk_size(chunk_size)
             .execute_stream(&mut reader)
             .await
             .map(|_| ());
@@ -4405,6 +4445,31 @@ mod test {
         );
     }
 
+    /// The part number and body length of each part request in `requests`, by part number.
+    #[cfg(all(
+        not(feature = "sync"),
+        any(feature = "with-tokio", feature = "with-async-std")
+    ))]
+    fn part_numbers_and_lengths(requests: &[MultipartWireRequest]) -> Vec<(u32, usize)> {
+        let mut parts = requests
+            .iter()
+            .filter(|request| request.line.contains("partNumber="))
+            .map(|request| {
+                let target = request.line.split_whitespace().nth(1).unwrap();
+                let query = target.split_once('?').unwrap().1;
+                let part_number = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("partNumber="))
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap();
+                (part_number, request.content_length)
+            })
+            .collect::<Vec<_>>();
+        parts.sort_unstable_by_key(|(part_number, _)| *part_number);
+        parts
+    }
+
     #[cfg(all(
         not(feature = "sync"),
         any(feature = "with-tokio", feature = "with-async-std")
@@ -4418,7 +4483,7 @@ mod test {
             super::CHUNK_SIZE + 1,
         ] {
             let (result, server_result) =
-                run_multipart_header_case(size, false, headers.clone()).await;
+                run_multipart_header_case(size, false, headers.clone(), super::CHUNK_SIZE).await;
             assert!(result.is_ok(), "stream upload failed: {result:?}");
             let requests = server_result.expect("local HTTP fixture failed");
 
@@ -4482,27 +4547,12 @@ mod test {
                 .iter()
                 .filter(|request| request.line.contains("partNumber="))
                 .collect::<Vec<_>>();
-            let mut part_numbers_and_lengths = parts
-                .iter()
-                .map(|request| {
-                    let target = request.line.split_whitespace().nth(1).unwrap();
-                    let query = target.split_once('?').unwrap().1;
-                    let part_number = query
-                        .split('&')
-                        .find_map(|pair| pair.strip_prefix("partNumber="))
-                        .unwrap()
-                        .parse::<u32>()
-                        .unwrap();
-                    (part_number, request.content_length)
-                })
-                .collect::<Vec<_>>();
-            part_numbers_and_lengths.sort_unstable_by_key(|(part_number, _)| *part_number);
             let expected_parts = if size == super::CHUNK_SIZE {
                 vec![(1, super::CHUNK_SIZE)]
             } else {
                 vec![(1, super::CHUNK_SIZE), (2, 1)]
             };
-            assert_eq!(part_numbers_and_lengths, expected_parts);
+            assert_eq!(part_numbers_and_lengths(&requests), expected_parts);
             for part in parts {
                 assert_wire_header(part, "content-type", Some("text/plain"));
                 assert_wire_header(
@@ -4570,7 +4620,8 @@ mod test {
         }
 
         let (result, server_result) =
-            run_multipart_header_case(super::CHUNK_SIZE, true, headers.clone()).await;
+            run_multipart_header_case(super::CHUNK_SIZE, true, headers.clone(), super::CHUNK_SIZE)
+                .await;
         assert!(matches!(
             result,
             Err(S3Error::Io(error)) if error.to_string() == "injected reader failure"
@@ -4619,7 +4670,8 @@ mod test {
                 HeaderValue::from_static("synthetic-value"),
             );
             let (result, server_result) =
-                run_multipart_header_case(super::CHUNK_SIZE, false, rejected).await;
+                run_multipart_header_case(super::CHUNK_SIZE, false, rejected, super::CHUNK_SIZE)
+                    .await;
             assert!(matches!(
                 result,
                 Err(S3Error::UnsupportedMultipartHeader(ref name)) if name.as_str() == rejected_name
@@ -4958,6 +5010,50 @@ mod test {
     #[async_std::test]
     async fn multipart_stream_builder_routes_headers_by_operation() {
         assert_multipart_builder_header_routing().await;
+    }
+
+    /// `with_chunk_size` sets both the multipart threshold and the part length: an object
+    /// one byte shorter goes up in one PUT, one exactly that long as a single full part,
+    /// one byte longer as a full part and a one-byte part.
+    #[cfg(all(
+        not(feature = "sync"),
+        any(feature = "with-tokio", feature = "with-async-std")
+    ))]
+    #[maybe_async::test(
+        feature = "sync",
+        async(all(not(feature = "sync"), feature = "with-tokio"), tokio::test),
+        async(
+            all(not(feature = "sync"), feature = "with-async-std"),
+            async_std::test
+        )
+    )]
+    async fn multipart_stream_builder_chunk_size_sets_threshold_and_part_length() {
+        const CHUNK: usize = 64 * 1024;
+        for (size, expected_parts) in [
+            (CHUNK - 1, vec![]),
+            (CHUNK, vec![(1, CHUNK)]),
+            (CHUNK + 1, vec![(1, CHUNK), (2, 1)]),
+        ] {
+            let (result, server_result) =
+                run_multipart_header_case(size, false, HeaderMap::new(), CHUNK).await;
+            assert!(result.is_ok(), "stream upload failed: {result:?}");
+            let requests = server_result.expect("local HTTP fixture failed");
+            let lines = requests
+                .iter()
+                .map(|request| request.line.as_str())
+                .collect::<Vec<_>>();
+            if expected_parts.is_empty() {
+                assert_eq!(requests.len(), 1, "{lines:?}");
+                assert!(
+                    requests[0].line.starts_with("PUT ") && !requests[0].line.contains('?'),
+                    "{lines:?}"
+                );
+                assert_eq!(requests[0].content_length, size);
+            } else {
+                assert_eq!(requests.len(), expected_parts.len() + 2, "{lines:?}");
+                assert_eq!(part_numbers_and_lengths(&requests), expected_parts);
+            }
+        }
     }
 
     #[allow(dead_code)]
