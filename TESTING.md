@@ -17,7 +17,7 @@ the default `tags` feature and for the `blocking` API:
 | --- | --- | --- | --- |
 | Tokio | native TLS | default features | library tests and examples; default feature set includes `tags` |
 | Tokio | no TLS | `with-tokio`, `aws-creds/http-credentials` | library tests and examples |
-| Tokio | rustls | `with-tokio`, `tokio-rustls-tls`, `aws-creds/http-credentials` | library tests and examples |
+| Tokio | rustls | `tokio-rustls-tls`, `aws-creds/http-credentials` | library tests and examples |
 | async-std | base/no TLS | `with-async-std-hyper`, `aws-creds/http-credentials` | library tests and examples |
 | async-std | native TLS | `async-std-native-tls`, `aws-creds/http-credentials` | library tests and examples |
 | async-std | rustls | `async-std-rustls-tls`, `aws-creds/http-credentials` | library tests and examples |
@@ -37,18 +37,23 @@ examples are compiled in that representative configuration; the other sync TLS
 variants still run their library and example coverage.
 
 The nine configurations cover `fail-on-err` disabled across all three
-runtimes. Default Tokio native TLS covers it enabled for Tokio. Two focused
+runtimes. Default Tokio native TLS covers it enabled for Tokio. Focused
 library-test commands also enable `fail-on-err` for async-std native TLS and
-sync native TLS, using the `xml_response_embedded_error_` and
-`multipart_stream_errors_attempt_abort_and_preserve_primary_error` filters.
-These checks cover embedded response errors and multipart cleanup without
-repeating the full runtime matrix.
+sync native TLS, with the `request_retry_`, `xml_response_embedded_error_`,
+`multipart_stream_errors_attempt_abort_and_preserve_primary_error` and
+`bucket_policy_` filters. These checks cover retries, embedded response errors,
+multipart cleanup and bucket policies without repeating the full runtime matrix.
+
+Two `content_encoding` runs check that a download keeps the bytes the server
+sent when another crate enables a decoder: Tokio with reqwest's `gzip`,
+`brotli`, `zstd` and `deflate`, and sync with attohttpc's `compress`.
 
 The GitHub workflow runs formatting and support-crate checks once, then runs
-three bounded S3 jobs for Tokio, async-std, and sync. Tokio covers native TLS, no
-TLS, and rustls; async-std and sync each cover three TLS configurations. Cargo registry and build caches are scoped by runtime,
-resolved workspace manifest, and Rust compiler fingerprint; cache paths exclude
-Cargo configuration and credentials. The repository ignores `Cargo.lock`, so
+three bounded S3 jobs for Tokio, async-std, and sync. Tokio covers native TLS,
+no TLS, and rustls; async-std and sync each cover three TLS configurations.
+Cargo registry and build caches are scoped by runtime, resolved workspace
+manifest, and Rust compiler fingerprint; cache paths exclude Cargo
+configuration and credentials. The repository ignores `Cargo.lock`, so
 CI resolves dependencies at run time and does not promise a fixed dependency
 snapshot across workflow runs.
 

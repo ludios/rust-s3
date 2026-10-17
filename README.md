@@ -70,13 +70,15 @@ All runtimes support either `native-tls` or `rustls-tls`, there are features for
 
 A download returns the bytes the server sends and reports their `Content-Encoding` as metadata. The `tokio` client never asks for a compressed transfer, and its decoders stay off even when another crate in the build enables `reqwest/gzip`, `brotli`, `zstd` or `deflate`. attohttpc's decoder cannot be switched off, and it asks servers to compress on its own: when another crate enables one of attohttpc's compression features (`compress` is in its defaults), the `sync` backend returns an error for an object download whose `Content-Encoding` is gzip or deflate, whether stored with the object or applied on the way, rather than its decoded bytes; `cargo tree -e features -i attohttpc` names the crate.
 
-To build with Tokio and rustls backed by ring, disable the default native-TLS feature:
+To build with Tokio and rustls on ring, disable the default native-TLS feature:
 
 ```bash
-cargo build -p rust-s3 --no-default-features --features tokio-rustls-tls-ring
+cargo build -p rust-s3 --no-default-features --features tokio-rustls-tls
 ```
 
-With `tokio-rustls-tls` alone (`tokio-rustls-tls-ring` includes it), the S3 client uses the rustls `CryptoProvider` the program installed process-wide before creating the `Bucket`, or ring if there is none, without installing one. It checks server certificates against the Mozilla roots bundled by `webpki-roots`; the system certificate store is not read. reqwest itself is built with `rustls-no-provider`, so a program that builds its own reqwest 0.13 clients on rustls, including through `s3::reqwest`, has to install a rustls `CryptoProvider` first or enable reqwest's `rustls` feature.
+`tokio-rustls-tls-ring` adds fetching credentials over HTTP (STS web identity, ECS, instance metadata), also with rustls on ring and the bundled Mozilla roots.
+
+Unless `tokio-native-tls` is enabled too, the `tokio-rustls-tls` S3 client uses the rustls `CryptoProvider` the program installed process-wide before creating the `Bucket`, or ring if there is none, without installing one. It checks server certificates against the Mozilla roots bundled by `webpki-roots`; the system certificate store is not read. reqwest itself is built with `rustls-no-provider`, so a program that builds its own reqwest 0.13 clients on rustls, including through `s3::reqwest`, has to install a rustls `CryptoProvider` first or enable reqwest's `rustls` feature.
 
 The default feature set remains Tokio with native TLS.
 

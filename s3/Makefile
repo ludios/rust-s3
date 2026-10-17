@@ -104,11 +104,11 @@ tokio-nossl-test-not-ignored:
 
 tokio-rustlstls-test: tokio-rustlstls-test-not-ignored
 tokio-rustlstls-clippy:
-	cargo clippy --no-default-features --features with-tokio --features tokio-rustls-tls --features aws-creds/http-credentials -- -D warnings
+	cargo clippy --no-default-features --features tokio-rustls-tls --features aws-creds/http-credentials -- -D warnings
 tokio-rustlstls-test-not-ignored:
-	cargo test --tests --examples --no-default-features --features with-tokio --features tokio-rustls-tls --features aws-creds/http-credentials
+	cargo test --tests --examples --no-default-features --features tokio-rustls-tls --features aws-creds/http-credentials
 tokio-rustlstls-test-ignored:
-	cargo test --no-default-features --features with-tokio --features tokio-rustls-tls --features aws-creds/http-credentials -- --ignored
+	cargo test --no-default-features --features tokio-rustls-tls --features aws-creds/http-credentials -- --ignored
 
 # `tokio-rustls-tls-ring` adds aws-creds' `rustls-tls-ring` (credential providers with TLS on
 # ring) to `tokio-rustls-tls`. The S3 tests make no HTTPS credential fetch, so they would only
