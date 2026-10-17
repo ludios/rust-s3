@@ -31,17 +31,9 @@ use tokio_stream::StreamExt;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ClientOptions {
     pub proxy: Option<reqwest::Proxy>,
-    #[cfg(any(
-        feature = "tokio-native-tls",
-        feature = "tokio-rustls-tls",
-        feature = "tokio-rustls-tls-ring"
-    ))]
+    #[cfg(any(feature = "tokio-native-tls", feature = "tokio-rustls-tls"))]
     pub accept_invalid_certs: bool,
-    #[cfg(any(
-        feature = "tokio-native-tls",
-        feature = "tokio-rustls-tls",
-        feature = "tokio-rustls-tls-ring"
-    ))]
+    #[cfg(any(feature = "tokio-native-tls", feature = "tokio-rustls-tls"))]
     pub accept_invalid_hostnames: bool,
 }
 
