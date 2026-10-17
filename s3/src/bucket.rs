@@ -4349,13 +4349,13 @@ mod test {
         );
     }
 
-    /// The part number and body length of each part request in `requests`, by part number.
+    /// The part number and body length of each part request in `requests`, in the order sent.
     #[cfg(all(
         not(feature = "sync"),
         any(feature = "with-tokio", feature = "with-async-std")
     ))]
     fn part_numbers_and_lengths(requests: &[MultipartWireRequest]) -> Vec<(u32, usize)> {
-        let mut parts = requests
+        requests
             .iter()
             .filter(|request| request.line.contains("partNumber="))
             .map(|request| {
@@ -4369,9 +4369,7 @@ mod test {
                     .unwrap();
                 (part_number, request.content_length)
             })
-            .collect::<Vec<_>>();
-        parts.sort_unstable_by_key(|(part_number, _)| *part_number);
-        parts
+            .collect()
     }
 
     #[cfg(all(
@@ -4604,6 +4602,8 @@ mod test {
         any(feature = "with-tokio", feature = "with-async-std")
     ))]
     impl MultipartTrackedReader {
+        /// Fills the front of `buffer` with the next bytes and returns how many: fewer than
+        /// asked only at the end, `0` once there, and an error for any poll after that.
         fn read_into(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             use std::sync::atomic::Ordering;
             if self.ended {
@@ -4644,15 +4644,16 @@ mod test {
         }
     }
 
-    /// A four-part upload against a scripted server: the parts arrive in order with the
-    /// bytes of their offsets, no chunk is read before the part before it was answered, the
-    /// reader is not polled after its end, and the completion lists the parts in order.
+    /// Three full chunks and `tail` more bytes (a short last part, or none) against a
+    /// scripted server: the parts arrive in order with the bytes of their offsets, no chunk is
+    /// read before the part before it was answered, the reader is not polled after its end,
+    /// and the completion lists the parts in order.
     #[cfg(all(
         not(feature = "sync"),
         any(feature = "with-tokio", feature = "with-async-std")
     ))]
     #[maybe_async::maybe_async]
-    async fn run_multipart_builder_success_case() -> Result<(), String> {
+    async fn run_multipart_builder_success_case(tail: usize) -> Result<(), String> {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4660,8 +4661,9 @@ mod test {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        const TAIL: usize = 17;
-        let total = 3 * super::CHUNK_SIZE + TAIL;
+        const FULL_PARTS: usize = 3;
+        let part_count = FULL_PARTS + usize::from(tail > 0);
+        let total = FULL_PARTS * super::CHUNK_SIZE + tail;
         let bytes_read = Arc::new(AtomicUsize::new(0));
         let server_bytes_read = Arc::clone(&bytes_read);
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
@@ -4769,8 +4771,12 @@ mod test {
                     .and_then(|value| value.parse().ok())
                     .ok_or_else(|| format!("missing part number in {line}"))
             }
-            fn verify_part(number: usize, body: &[u8]) -> Result<(), String> {
-                let expected_len = if number == 4 { TAIL } else { super::CHUNK_SIZE };
+            fn verify_part(number: usize, body: &[u8], tail: usize) -> Result<(), String> {
+                let expected_len = if number > FULL_PARTS {
+                    tail
+                } else {
+                    super::CHUNK_SIZE
+                };
                 if body.len() != expected_len {
                     return Err(format!(
                         "part {number} length {} != {expected_len}",
@@ -4787,14 +4793,14 @@ mod test {
                 }
                 Ok(())
             }
-            for part_number in 1..=4 {
+            for part_number in 1..=part_count {
                 let mut stream = accept_until(&listener, &done_rx, deadline)?;
                 let (line, body) = read_request(&mut stream, deadline)?;
                 let received_number = number(&line)?;
                 if received_number != part_number {
                     return Err(format!("expected part {part_number}, got {line}"));
                 }
-                verify_part(part_number, &body)?;
+                verify_part(part_number, &body, tail)?;
                 let allowed = (part_number * super::CHUNK_SIZE).min(total);
                 let observed = server_bytes_read.load(Ordering::SeqCst);
                 if observed > allowed {
@@ -4811,7 +4817,7 @@ mod test {
                 return Err(format!("unexpected completion: {line}"));
             }
             let xml = String::from_utf8(body).map_err(|e| e.to_string())?;
-            let expected_blocks = (1..=4)
+            let expected_blocks = (1..=part_count)
                 .map(|part| {
                     format!(
                         "<Part><PartNumber>{part}</PartNumber><ETag>\"etag-{part}\"</ETag></Part>"
@@ -5393,9 +5399,11 @@ mod test {
         )
     )]
     async fn multipart_stream_uploads_parts_in_order_without_reading_ahead() {
-        run_multipart_builder_success_case()
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
+        for tail in [17, 0] {
+            run_multipart_builder_success_case(tail)
+                .await
+                .unwrap_or_else(|error| panic!("tail {tail}: {error}"));
+        }
     }
 
     #[test]
