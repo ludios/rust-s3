@@ -1,3 +1,5 @@
+# Model-output: Claude Opus 5.5
+
 name: build
 
 on:
@@ -75,5 +77,16 @@ jobs:
           key: ${{ runner.os }}-${{ steps.toolchain.outputs.fingerprint }}-${{ matrix.runtime }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-${{ steps.toolchain.outputs.fingerprint }}-${{ matrix.runtime }}-
+      # s3/tests/garage.rs starts its own garage servers. Garage publishes no checksums; this
+      # one is the SHA-256 of the v2.4.1 binary as first downloaded.
+      - name: Install garage for the end-to-end tests
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL -o "$HOME/.local/bin/garage" \
+            https://garagehq.deuxfleurs.fr/_releases/v2.4.1/x86_64-unknown-linux-musl/garage
+          echo "ae49f8de4aaee6b5ca305f7cbdccc8cd8a29b2804aac074649f18bfb83d0a2b6  $HOME/.local/bin/garage" \
+            | sha256sum -c -
+          chmod +x "$HOME/.local/bin/garage"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Check S3 runtime and TLS configurations
         run: make ${{ matrix.target }}

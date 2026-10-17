@@ -48,6 +48,23 @@ Two `content_encoding` runs check that a download keeps the bytes the server
 sent when another crate enables a decoder: Tokio with reqwest's `gzip`,
 `brotli`, `zstd` and `deflate`, and sync with attohttpc's `compress`.
 
+## Garage end-to-end tests
+
+`s3/tests/garage.rs` runs in every configuration above, as part of
+`cargo test --tests`. Each test starts its own garage server
+(`s3/tests/garage_server`) on free localhost ports with a fresh bucket and key,
+and removes it afterwards, so the tests run in parallel and need no credentials.
+`garage` must be on PATH: without it the tests fail rather than skip, and the
+GitHub workflow installs a pinned release. They cover streamed uploads below,
+at, and above the part length, with the part boundaries checked through the
+multipart ETag; builder headers; the abort after a failing source; manual
+multipart uploads, aborts, and listing pagination; whole, ranged, streamed, and
+writer reads, including a range past the end; and single and bulk deletes,
+partly on a key that needs percent-encoding. Garage accepts parts under 5 MiB,
+so the async configurations upload 256 KiB parts; sync uses its fixed 8 MiB.
+
+## GitHub workflow
+
 The GitHub workflow runs formatting and support-crate checks once, then runs
 three bounded S3 jobs for Tokio, async-std, and sync. Tokio covers native TLS,
 no TLS, and rustls; async-std and sync each cover three TLS configurations.
@@ -63,7 +80,7 @@ The ignored MinIO tests expect `http://localhost:9000`, an existing bucket named
 `rust-s3`, and `MINIO_ACCESS_KEY_ID` / `MINIO_SECRET_ACCESS_KEY`. Use a disposable
 MinIO instance with its own data and certificate directories, bound to loopback,
 and temporary credentials. Do not point these fixed-name fixtures at a shared
-bucket. The default test suite does not start a server.
+bucket.
 
 Build the test executable from the repository with
 `cargo test -p rust-s3 --lib --no-run --message-format=json`, adding

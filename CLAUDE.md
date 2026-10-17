@@ -93,7 +93,7 @@ The library uses extensive feature flags to control dependencies:
 
 ### Testing Approach
 
-Tests are primarily integration tests marked with `#[ignore]` that require actual S3 credentials. They're located inline within source files using `#[cfg(test)]` modules. Run ignored tests with:
+Unit tests live inline in `#[cfg(test)]` modules; `s3/tests/` holds tests of the public API against a fake S3 (`fake_s3`) and, in `garage.rs`, end to end against an ephemeral garage server per test (`garage_server`; `garage` must be on PATH). Uploads, reads and deletes that need a real service belong there. Provider tests against real cloud accounts are marked `#[ignore]` and need credentials. Run them with:
 
 ```bash
 cargo test -- --ignored
