@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 //! Builder pattern for S3 PUT operations with customizable options
 //!
@@ -212,7 +213,8 @@ impl<'a> PutObjectRequest<'a> {
 /// Builder for streaming PUT operations.
 ///
 /// If an error is returned after multipart initiation, the upload is aborted on
-/// a best-effort basis. Cancelling the future cannot run an asynchronous abort,
+/// a best-effort basis, bounded by the default 60-second `request_timeout` when
+/// the bucket sets none. Cancelling the future cannot run an asynchronous abort,
 /// and a part already sent or a lost completion response can leave remote state
 /// uncertain.
 ///
