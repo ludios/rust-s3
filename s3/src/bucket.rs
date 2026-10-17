@@ -2036,6 +2036,10 @@ impl Bucket {
         content_type: &str,
         custom_headers: &HeaderMap,
     ) -> Result<ResponseData, S3Error> {
+        log::debug!(
+            "multipart upload {upload_id} to {path}: uploading part {part_number}, {} bytes",
+            chunk.len()
+        );
         let command = Command::PutObject {
             content: &chunk,
             multipart: Some(Multipart::new(part_number, upload_id)), // upload_id: &msg.upload_id,
@@ -2056,8 +2060,11 @@ impl Bucket {
     ) -> Result<T, S3Error> {
         // Cleanup is best effort. Keep the operation's original error even if
         // the abort fails (for example, if completion already reached S3).
+        log::warn!("multipart upload {upload_id} to {path}: aborting after {error}");
         let bucket = self.with_overlaid_extra_headers(abort_headers);
-        let _ = bucket.abort_upload(path, upload_id).await;
+        if let Err(abort_error) = bucket.abort_upload(path, upload_id).await {
+            log::warn!("multipart upload {upload_id} to {path}: abort failed, {abort_error}");
+        }
         Err(error)
     }
 
@@ -2135,24 +2142,21 @@ impl Bucket {
     ) -> Result<PutStreamResponse, S3Error> {
         let first_chunk = crate::utils::read_chunk_async(reader, chunk_size).await?;
         if first_chunk.len() < chunk_size {
-            let total_size = first_chunk.len();
-            // Use the builder pattern for small files
-            let mut builder = self
-                .put_object_builder(s3_path, first_chunk.as_slice())
-                .with_content_type(content_type);
-
-            // Add custom headers if provided
-            if let Some(headers) = custom_headers {
-                builder = builder.with_headers(headers);
-            }
-
-            let response_data = builder.execute().await?;
+            // Borrowed: `put_object_builder` would copy the chunk once more
+            let response_data = self
+                .put_object_with_content_type_and_headers(
+                    s3_path,
+                    &first_chunk,
+                    content_type,
+                    custom_headers,
+                )
+                .await?;
             if response_data.status_code() >= 300 {
                 return Err(error_from_response_data(response_data)?);
             }
             return Ok(PutStreamResponse::new(
                 response_data.status_code(),
-                total_size,
+                first_chunk.len(),
             ));
         }
 
@@ -2490,6 +2494,10 @@ impl Bucket {
         upload_id: &str,
         parts: Vec<Part>,
     ) -> Result<ResponseData, S3Error> {
+        log::debug!(
+            "multipart upload {upload_id} to {path}: completing with {} parts",
+            parts.len()
+        );
         let data = CompleteMultipartUploadData { parts };
         let complete = Command::CompleteMultipartUpload { upload_id, data };
         let complete_request = RequestImpl::new(self, path, complete).await?;
@@ -2504,6 +2512,10 @@ impl Bucket {
         upload_id: &str,
         parts: Vec<Part>,
     ) -> Result<ResponseData, S3Error> {
+        log::debug!(
+            "multipart upload {upload_id} to {path}: completing with {} parts",
+            parts.len()
+        );
         let data = CompleteMultipartUploadData { parts };
         let complete = Command::CompleteMultipartUpload { upload_id, data };
         let complete_request = RequestImpl::new(self, path, complete)?;
