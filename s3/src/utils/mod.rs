@@ -290,7 +290,7 @@ impl From<&attohttpc::header::HeaderMap> for HeadObjectResult {
                 .get("Content-Length")
                 .map(|v| v.to_str().unwrap_or_default().parse().unwrap_or_default()),
             content_type: headers
-                .get("get-Type")
+                .get("Content-Type")
                 .map(|v| v.to_str().unwrap_or_default().to_string()),
             delete_marker: headers
                 .get("x-amz-delete-marker")
