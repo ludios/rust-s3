@@ -1,3 +1,5 @@
+// Model-output: Claude Opus 5.5
+
 #![allow(dead_code)]
 
 use crate::error::CredentialsError;
@@ -273,8 +275,15 @@ pub fn set_request_timeout(timeout: Option<Duration>) -> Option<Duration> {
     }
 }
 
+/// Prepares a credential request: the request timeout, if one was set, and on rustls with ring
+/// the bundled Mozilla roots, which attohttpc's ring TLS does not load itself.
 #[cfg(feature = "http-credentials")]
-fn apply_timeout(builder: attohttpc::RequestBuilder) -> attohttpc::RequestBuilder {
+fn prepare_request(builder: attohttpc::RequestBuilder) -> attohttpc::RequestBuilder {
+    #[cfg(all(feature = "rustls-tls-ring", not(feature = "native-tls")))]
+    let builder = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .cloned()
+        .fold(builder, attohttpc::RequestBuilder::add_root_certificate);
     let timeout_ms = REQUEST_TIMEOUT_MS.load(Ordering::Relaxed);
     if timeout_ms > 0 {
         return builder.timeout(Duration::from_millis(timeout_ms as u64));
@@ -285,7 +294,7 @@ fn apply_timeout(builder: attohttpc::RequestBuilder) -> attohttpc::RequestBuilde
 /// Sends a GET request to `url` with a request timeout if one was set.
 #[cfg(feature = "http-credentials")]
 fn http_get(url: &str) -> attohttpc::Result<attohttpc::Response> {
-    let builder = apply_timeout(attohttpc::get(url));
+    let builder = prepare_request(attohttpc::get(url));
 
     builder.send()
 }
@@ -431,7 +440,7 @@ fn fetch_container_credentials(
     let url = match endpoint {
         ContainerEndpoint::Relative(url) | ContainerEndpoint::Full(url) => url,
     };
-    let mut request = apply_timeout(attohttpc::get(url.as_str())).follow_redirects(false);
+    let mut request = prepare_request(attohttpc::get(url.as_str())).follow_redirects(false);
     if url.scheme() == "http" {
         request = request.proxy_settings(attohttpc::ProxySettings::builder().build());
     }
@@ -701,13 +710,13 @@ impl Credentials {
             return Err(CredentialsError::NotEc2);
         }
 
-        let role = apply_timeout(attohttpc::get(
+        let role = prepare_request(attohttpc::get(
             "http://169.254.169.254/latest/meta-data/iam/security-credentials",
         ))
         .send()?
         .text()?;
 
-        let resp: CredentialsFromInstanceMetadata = apply_timeout(attohttpc::get(format!(
+        let resp: CredentialsFromInstanceMetadata = prepare_request(attohttpc::get(format!(
             "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
             role
         )))
@@ -730,7 +739,7 @@ impl Credentials {
             return Err(CredentialsError::NotEc2);
         }
 
-        let token = apply_timeout(attohttpc::put("http://169.254.169.254/latest/api/token"))
+        let token = prepare_request(attohttpc::put("http://169.254.169.254/latest/api/token"))
             .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
             .send()?;
         if !token.is_success() {
@@ -740,14 +749,14 @@ impl Credentials {
         }
         let token = token.text()?;
 
-        let role = apply_timeout(attohttpc::get(
+        let role = prepare_request(attohttpc::get(
             "http://169.254.169.254/latest/meta-data/iam/security-credentials",
         ))
         .header("X-aws-ec2-metadata-token", &token)
         .send()?
         .text()?;
 
-        let resp: CredentialsFromInstanceMetadata = apply_timeout(attohttpc::get(format!(
+        let resp: CredentialsFromInstanceMetadata = prepare_request(attohttpc::get(format!(
             "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
             role
         )))
@@ -1559,6 +1568,22 @@ aws_secret_access_key = SECRET
             assert!(rendered.contains("expiration"));
             assert!(rendered.contains("1970"));
         }
+    }
+
+    /// With no roots, attohttpc fails to build its certificate verifier before the handshake
+    /// starts; with roots, the handshake starts and fails only because the listener hangs up.
+    #[cfg(all(feature = "rustls-tls-ring", not(feature = "native-tls")))]
+    #[test]
+    fn rustls_ring_credential_requests_trust_bundled_roots() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || drop(listener.accept().unwrap()));
+        let error = http_get(&format!("https://{address}/")).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            !matches!(error.kind(), attohttpc::ErrorKind::ServerCertVerifier(_)),
+            "{error}"
+        );
     }
 
     #[test]

@@ -110,8 +110,9 @@ tokio-rustlstls-test-not-ignored:
 tokio-rustlstls-test-ignored:
 	cargo test --no-default-features --features with-tokio --features tokio-rustls-tls --features aws-creds/http-credentials -- --ignored
 
-# `tokio-rustls-tls-ring` adds only a ring-backed TLS stack for credential fetches to
-# `tokio-rustls-tls`, which no library test reaches, so it is linted but not tested again.
+# `tokio-rustls-tls-ring` adds aws-creds' `rustls-tls-ring` (credential providers with TLS on
+# ring) to `tokio-rustls-tls`. The S3 tests make no HTTPS credential fetch, so they would only
+# repeat the rustls run; the root Makefile's creds-test covers that stack.
 tokio-rustls-ring-clippy:
 	cargo clippy --no-default-features --features tokio-rustls-tls-ring --features aws-creds/http-credentials -- -D warnings
 

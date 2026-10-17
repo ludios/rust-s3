@@ -25,9 +25,11 @@ the default `tags` feature and for the `blocking` API:
 | sync | rustls | `sync`, `sync-rustls-tls`, `aws-creds/http-credentials` | library tests and examples |
 | sync | no TLS | `sync`, `aws-creds/http-credentials` | library tests and examples |
 
-`tokio-rustls-tls-ring` is linted but not tested again: over `tokio-rustls-tls`, it
-adds only a ring-backed TLS stack for credential fetches, which no library test
-reaches.
+`tokio-rustls-tls-ring` gets clippy but no second run of these tests. It adds
+aws-creds' `rustls-tls-ring` to `tokio-rustls-tls`: HTTP credential providers
+whose TLS runs on ring. That differs from the rustls row above only in the TLS
+stack, which none of these tests use; the `aws-creds` suite runs again with
+`rustls-tls-ring` alone to cover it.
 
 Doctests run for default Tokio, Tokio with `blocking`, async-std native TLS with
 `tags` and `blocking`, and sync native TLS with `tags`. The sync documentation

@@ -58,8 +58,11 @@ s3-test-all:
 region-test:
 	cd aws-region && cargo test
 
+# Also with `rustls-tls-ring` alone, the TLS stack `tokio-rustls-tls-ring` brings, whose roots
+# aws-creds loads itself.
 creds-test:
 	cd aws-creds && cargo test
+	cd aws-creds && cargo test --no-default-features --features rustls-tls-ring
 
 s3-fmt:
 	cd s3 && cargo fmt --all
