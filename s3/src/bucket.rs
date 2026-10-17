@@ -2103,6 +2103,7 @@ impl Bucket {
         custom_headers: Option<http::HeaderMap>,
         chunk_size: usize,
     ) -> Result<PutStreamResponse, S3Error> {
+        assert!(chunk_size > 0, "chunk_size must be nonzero");
         let first_chunk = crate::utils::read_chunk_async(reader, chunk_size).await?;
         if first_chunk.len() < chunk_size {
             // Borrowed: `put_object_builder` would copy the chunk once more
@@ -2133,14 +2134,16 @@ impl Bucket {
         let path = s3_path;
         let upload_id = &msg.upload_id;
 
-        // One part at a time, as the chunk in hand is the only one in memory. A failure finds
-        // nothing else in flight, so the abort follows at once.
+        // One part at a time: the chunk in hand is the only one in memory. The upload ends
+        // with the first chunk shorter than `chunk_size`, or with an empty read after a full
+        // one; the reader is not polled past its end.
         let upload_result: Result<(Vec<Part>, usize), S3Error> = async {
             let mut parts = Vec::new();
             let mut total_size = 0;
             let mut chunk = first_chunk;
             while !chunk.is_empty() {
                 let part_number = parts.len() as u32 + 1;
+                let last = chunk.len() < chunk_size;
                 total_size += chunk.len();
                 let response = self
                     .make_multipart_request(
@@ -2153,7 +2156,11 @@ impl Bucket {
                     )
                     .await?;
                 parts.push(part_from_response(response, part_number)?);
-                chunk = crate::utils::read_chunk_async(reader, chunk_size).await?;
+                chunk = if last {
+                    Vec::new()
+                } else {
+                    crate::utils::read_chunk_async(reader, chunk_size).await?
+                };
             }
             Ok((parts, total_size))
         }
@@ -4050,7 +4057,7 @@ mod test {
         use std::time::{Duration, Instant};
 
         /// One request from `stream`, or `None` for a connection closed before a request
-        /// line was sent: a part the client gave up on when its upload failed.
+        /// line was sent, which the caller skips.
         fn read_request(
             stream: &mut std::net::TcpStream,
             deadline: Instant,
@@ -4224,8 +4231,8 @@ mod test {
             }
 
             // The operation signals only after returning, so this also catches an unexpected
-            // extra request without a timing-based sleep. A connection without a request is a
-            // part the client gave up on, and does not end the watch.
+            // extra request without a timing-based sleep. A connection without a request does
+            // not end the watch.
             let mut done = false;
             loop {
                 done |= done_rx.try_recv().is_ok();
@@ -4588,6 +4595,8 @@ mod test {
         }
     }
 
+    /// `remaining` patterned bytes, counting what was read into `bytes_read` as it goes. A
+    /// poll after it reported its end is an error: a reader need not be fused.
     #[cfg(all(
         not(feature = "sync"),
         any(feature = "with-tokio", feature = "with-async-std")
@@ -4595,6 +4604,28 @@ mod test {
     struct MultipartTrackedReader {
         remaining: usize,
         bytes_read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ended: bool,
+    }
+
+    #[cfg(all(
+        not(feature = "sync"),
+        any(feature = "with-tokio", feature = "with-async-std")
+    ))]
+    impl MultipartTrackedReader {
+        fn read_into(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            use std::sync::atomic::Ordering;
+            if self.ended {
+                return Err(std::io::Error::other("reader polled after its end"));
+            }
+            let count = self.remaining.min(buffer.len());
+            let offset = self.bytes_read.fetch_add(count, Ordering::SeqCst);
+            for (index, byte) in buffer[..count].iter_mut().enumerate() {
+                *byte = ((offset + index) % 251) as u8;
+            }
+            self.remaining -= count;
+            self.ended = self.remaining == 0 && count == 0;
+            Ok(count)
+        }
     }
 
     #[cfg(all(not(feature = "sync"), feature = "with-tokio"))]
@@ -4604,15 +4635,8 @@ mod test {
             _context: &mut std::task::Context<'_>,
             buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
-            use std::sync::atomic::Ordering;
-            let this = self.get_mut();
-            let count = this.remaining.min(buffer.remaining());
-            let offset = this.bytes_read.fetch_add(count, Ordering::SeqCst);
-            for (index, byte) in buffer.initialize_unfilled()[..count].iter_mut().enumerate() {
-                *byte = ((offset + index) % 251) as u8;
-            }
+            let count = self.get_mut().read_into(buffer.initialize_unfilled())?;
             buffer.advance(count);
-            this.remaining -= count;
             std::task::Poll::Ready(Ok(()))
         }
     }
@@ -4624,21 +4648,13 @@ mod test {
             _context: &mut std::task::Context<'_>,
             buffer: &mut [u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
-            use std::sync::atomic::Ordering;
-            let this = self.get_mut();
-            let count = this.remaining.min(buffer.len());
-            let offset = this.bytes_read.fetch_add(count, Ordering::SeqCst);
-            for (index, byte) in buffer[..count].iter_mut().enumerate() {
-                *byte = ((offset + index) % 251) as u8;
-            }
-            this.remaining -= count;
-            std::task::Poll::Ready(Ok(count))
+            std::task::Poll::Ready(self.get_mut().read_into(buffer))
         }
     }
 
     /// A four-part upload against a scripted server: the parts arrive in order with the
-    /// bytes of their offsets, no chunk is read before the part before it was answered, and
-    /// the completion lists the parts in order.
+    /// bytes of their offsets, no chunk is read before the part before it was answered, the
+    /// reader is not polled after its end, and the completion lists the parts in order.
     #[cfg(all(
         not(feature = "sync"),
         any(feature = "with-tokio", feature = "with-async-std")
@@ -4839,6 +4855,7 @@ mod test {
         let mut reader = MultipartTrackedReader {
             remaining: total,
             bytes_read,
+            ended: false,
         };
         let result = bucket
             .put_object_stream_builder("/multipart-test")
@@ -5001,8 +5018,7 @@ mod test {
         use std::time::{Duration, Instant};
 
         /// One request from `stream`, its line and body length, or `None` for a connection
-        /// closed before a request line was sent: a part the client gave up on when its
-        /// upload failed.
+        /// closed before a request line was sent, which the caller skips.
         fn read_request(
             stream: &mut std::net::TcpStream,
             request_index: usize,
