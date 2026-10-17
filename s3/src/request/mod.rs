@@ -6,6 +6,8 @@ pub mod async_std_backend;
 pub mod blocking;
 pub mod request_trait;
 pub(crate) mod request_url;
+#[cfg(all(feature = "tokio-rustls-tls", not(feature = "tokio-native-tls")))]
+mod rustls_tls;
 #[cfg(feature = "with-tokio")]
 pub mod tokio_backend;
 

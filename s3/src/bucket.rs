@@ -6144,6 +6144,11 @@ mod test {
             corrected.client_options.accept_invalid_hostnames,
             deprecated_alias.client_options.accept_invalid_hostnames
         );
+
+        // Every combination builds a client, including accepting a wrong hostname alone.
+        for (certs, hostnames) in [(false, false), (false, true), (true, false)] {
+            bucket.set_dangerous_config(certs, hostnames).unwrap();
+        }
     }
     fn test_aws_credentials() -> Credentials {
         Credentials::new(

@@ -47,13 +47,6 @@ pub(crate) struct ClientOptions {
 
 #[cfg(feature = "with-tokio")]
 pub(crate) fn client(options: &ClientOptions) -> Result<reqwest::Client, S3Error> {
-    // reqwest is built without a rustls crypto provider and panics when it builds a rustls
-    // client with no process-wide default, so install ring unless the program already
-    // installed a provider (then `install_default` fails, which is fine). With native TLS
-    // also enabled, reqwest uses that and rustls is never reached.
-    #[cfg(all(feature = "tokio-rustls-tls", not(feature = "tokio-native-tls")))]
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     // Request timeouts are applied to individual requests so changing a
     // Bucket's timeout does not require rebuilding this client (or lose its
     // proxy/TLS configuration).
@@ -74,23 +67,19 @@ pub(crate) fn client(options: &ClientOptions) -> Result<reqwest::Client, S3Error
         client
     };
 
+    // With both TLS features, reqwest uses native TLS, as it always has. rustls alone gets a
+    // configuration of its own, which also keeps it on rustls if another crate in the build
+    // switches on reqwest's native TLS.
     cfg_if::cfg_if! {
-        if #[cfg(any(
-            feature = "tokio-native-tls",
-            feature = "tokio-rustls-tls",
-            feature = "tokio-rustls-tls-ring"
-        ))] {
-            let client = client.danger_accept_invalid_certs(options.accept_invalid_certs);
-        }
-    }
-
-    cfg_if::cfg_if! {
-        if #[cfg(any(
-            feature = "tokio-native-tls",
-            feature = "tokio-rustls-tls",
-            feature = "tokio-rustls-tls-ring"
-        ))] {
-            let client = client.danger_accept_invalid_hostnames(options.accept_invalid_hostnames);
+        if #[cfg(feature = "tokio-native-tls")] {
+            let client = client
+                .tls_danger_accept_invalid_certs(options.accept_invalid_certs)
+                .tls_danger_accept_invalid_hostnames(options.accept_invalid_hostnames);
+        } else if #[cfg(feature = "tokio-rustls-tls")] {
+            let client = client.tls_backend_preconfigured(super::rustls_tls::client_config(
+                options.accept_invalid_certs,
+                options.accept_invalid_hostnames,
+            ));
         }
     }
 

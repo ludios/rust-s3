@@ -1,3 +1,5 @@
+# Model-output: Claude Opus 5.5
+
 [package]
 name = "rust-s3"
 version = "0.38.0"
@@ -64,8 +66,8 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 reqwest = { version = "0.13", optional = true, features = [
     "stream",
 ], default-features = false }
-# Only for `tokio-rustls-tls` to fall back to ring; see that feature.
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+# Only for `tokio-rustls-tls`: its client's configuration, on ring with bundled roots.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
@@ -82,6 +84,7 @@ tokio = { version = "1", features = [
 ], optional = true, default-features = false }
 tokio-stream = { version = "0.1", optional = true }
 url = "2"
+webpki-roots = { version = "1", optional = true }
 
 [features]
 default = ["fail-on-err", "tags", "tokio-native-tls", "http-credentials-native-tls"]
@@ -114,9 +117,10 @@ http-credentials-rustls-tls = ["aws-creds/rustls-tls"]
 http-credentials-rustls-tls-ring = ["aws-creds/rustls-tls-ring"]
 
 tokio-native-tls = ["reqwest/native-tls", "with-tokio"]
-# reqwest's own `rustls` falls back to aws-lc-rs; this keeps ring instead: the first client
-# installs ring as the process-wide rustls default unless the program installed one already.
-tokio-rustls-tls = ["reqwest/rustls-no-provider", "dep:rustls", "with-tokio"]
+# The client is configured with ring and the bundled Mozilla roots, whatever rustls provider
+# the program installs process-wide: reqwest's own `rustls` would bring aws-lc-rs and read the
+# system certificate store.
+tokio-rustls-tls = ["reqwest/rustls-no-provider", "dep:rustls", "dep:webpki-roots", "with-tokio"]
 # The one client feature that does bring credential fetching: the S3 client's rustls already
 # uses ring, so what this adds over `tokio-rustls-tls` is a credential fetcher on ring as well.
 tokio-rustls-tls-ring = ["tokio-rustls-tls", "http-credentials-rustls-tls-ring"]
