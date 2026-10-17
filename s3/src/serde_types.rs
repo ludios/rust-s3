@@ -1025,14 +1025,20 @@ mod test {
     #[test]
     fn delete_objects_request_xml_escaping() {
         let request = DeleteObjectsRequest {
-            objects: vec![ObjectIdentifier::new("file&name<>.txt")],
+            objects: vec![
+                ObjectIdentifier::new("file&name<>.txt"),
+                // A parser reads a raw CR as LF, which would name another key.
+                ObjectIdentifier::new("cr\rlf\n"),
+            ],
             quiet: false,
         };
 
         let se = request.to_string();
         assert_eq!(
             se,
-            r#"<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>file&amp;name&lt;&gt;.txt</Key></Object></Delete>"#
+            "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Object><Key>file&amp;name&lt;&gt;.txt</Key></Object>\
+             <Object><Key>cr&#13;lf\n</Key></Object></Delete>"
         )
     }
 

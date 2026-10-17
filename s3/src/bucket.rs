@@ -130,10 +130,7 @@ fn validate_success_xml_response(
                     match attr {
                         Ok(attr)
                             if attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .is_ok() => {}
                         _ => {
                             valid = false;
@@ -146,8 +143,7 @@ fn validate_success_xml_response(
                         valid = false;
                         break;
                     }
-                    root =
-                        Some(String::from_utf8_lossy(element.local_name().as_ref()).into_owned());
+                    root = Some(element.local_name().into_inner().to_owned());
                 }
                 depth += 1;
             }
@@ -156,10 +152,7 @@ fn validate_success_xml_response(
                     match attr {
                         Ok(attr)
                             if attr
-                                .decoded_and_normalized_value(
-                                    quick_xml::XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .is_ok() => {}
                         _ => {
                             valid = false;
@@ -172,8 +165,7 @@ fn validate_success_xml_response(
                         valid = false;
                         break;
                     }
-                    root =
-                        Some(String::from_utf8_lossy(element.local_name().as_ref()).into_owned());
+                    root = Some(element.local_name().into_inner().to_owned());
                 }
             }
             Ok(Event::End(_)) => {
@@ -184,18 +176,14 @@ fn validate_success_xml_response(
                 depth -= 1;
             }
             Ok(Event::Text(text)) => {
-                // quick-xml 0.38's xml_content() used XML 1.1 normalization.
-                // Keep that behavior explicit across the 0.41 API change.
-                if text.xml11_content().is_err()
-                    || (depth == 0 && !text.as_ref().iter().all(u8::is_ascii_whitespace))
-                {
+                if depth == 0 && !text.bytes().all(|b| b.is_ascii_whitespace()) {
                     valid = false;
                     break;
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
-                let name = reference.as_ref();
-                let predefined = matches!(name, b"amp" | b"lt" | b"gt" | b"apos" | b"quot");
+                let name: &str = &reference;
+                let predefined = matches!(name, "amp" | "lt" | "gt" | "apos" | "quot");
                 if depth == 0
                     || (!predefined && reference.resolve_char_ref().ok().flatten().is_none())
                 {
@@ -210,7 +198,7 @@ fn validate_success_xml_response(
             }
             Ok(Event::Decl(declaration)) if root.is_none() && !declaration_seen => {
                 declaration_seen = true;
-                if !matches!(declaration.version().as_deref(), Ok(b"1.0") | Ok(b"1.1")) {
+                if !matches!(declaration.version().as_deref(), Ok("1.0") | Ok("1.1")) {
                     valid = false;
                     break;
                 }
