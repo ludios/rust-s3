@@ -117,9 +117,9 @@ http-credentials-rustls-tls = ["aws-creds/rustls-tls"]
 http-credentials-rustls-tls-ring = ["aws-creds/rustls-tls-ring"]
 
 tokio-native-tls = ["reqwest/native-tls", "with-tokio"]
-# The client is configured with ring and the bundled Mozilla roots, whatever rustls provider
-# the program installs process-wide: reqwest's own `rustls` would bring aws-lc-rs and read the
-# system certificate store.
+# The client is configured with the program's process-wide rustls provider, or ring if none is
+# installed, and the bundled Mozilla roots: reqwest's own `rustls` would bring aws-lc-rs and read
+# the system certificate store.
 tokio-rustls-tls = ["reqwest/rustls-no-provider", "dep:rustls", "dep:webpki-roots", "with-tokio"]
 # The one client feature that does bring credential fetching: the S3 client's rustls already
 # uses ring, so what this adds over `tokio-rustls-tls` is a credential fetcher on ring as well.

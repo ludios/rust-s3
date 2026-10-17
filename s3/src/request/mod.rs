@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 #[cfg(feature = "with-async-std")]
 pub mod async_std_backend;

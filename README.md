@@ -76,7 +76,7 @@ To build with Tokio and rustls backed by ring, disable the default native-TLS fe
 cargo build -p rust-s3 --no-default-features --features tokio-rustls-tls-ring
 ```
 
-With `tokio-rustls-tls` alone (`tokio-rustls-tls-ring` includes it), the S3 client uses ring and checks server certificates against the Mozilla roots bundled by `webpki-roots`, whatever rustls provider the program installs process-wide; the system certificate store is not read. reqwest itself is built with `rustls-no-provider`, so a program that builds its own reqwest 0.13 clients on rustls, including through `s3::reqwest`, has to install a rustls `CryptoProvider` first or enable reqwest's `rustls` feature.
+With `tokio-rustls-tls` alone (`tokio-rustls-tls-ring` includes it), the S3 client uses the rustls `CryptoProvider` the program installed process-wide before creating the `Bucket`, or ring if there is none, without installing one. It checks server certificates against the Mozilla roots bundled by `webpki-roots`; the system certificate store is not read. reqwest itself is built with `rustls-no-provider`, so a program that builds its own reqwest 0.13 clients on rustls, including through `s3::reqwest`, has to install a rustls `CryptoProvider` first or enable reqwest's `rustls` feature.
 
 The default feature set remains Tokio with native TLS.
 

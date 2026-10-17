@@ -67,12 +67,12 @@ pub(crate) fn client(options: &ClientOptions) -> Result<reqwest::Client, S3Error
         client
     };
 
-    // With both TLS features, reqwest uses native TLS, as it always has. rustls alone gets a
-    // configuration of its own, which also keeps it on rustls if another crate in the build
-    // switches on reqwest's native TLS.
+    // With both TLS features, the client uses native TLS. Each backend is chosen explicitly, so
+    // another crate enabling a different reqwest TLS feature cannot change it.
     cfg_if::cfg_if! {
         if #[cfg(feature = "tokio-native-tls")] {
             let client = client
+                .tls_backend_native()
                 .tls_danger_accept_invalid_certs(options.accept_invalid_certs)
                 .tls_danger_accept_invalid_hostnames(options.accept_invalid_hostnames);
         } else if #[cfg(feature = "tokio-rustls-tls")] {
