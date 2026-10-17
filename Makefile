@@ -13,7 +13,7 @@
 # Plain `make` is the full credential-free developer and CI path.
 all: ci
 
-# Check formatting, lint every S3 runtime/TLS combination, then test all ten
+# Check formatting, lint every S3 runtime/TLS combination, then test all nine
 # library/example configurations and representative docs.
 ci: fmt-check clippy test
 

@@ -1,4 +1,5 @@
 # Model-output: Claude Fable 5.1
+# Model-output: Claude Opus 5.5
 
 # Keep CI, matrix, and integration phases serial: concurrent feature builds
 # contend for the shared target directory and can hit the same providers.
@@ -30,7 +31,7 @@
 	sync-nossl-clippy sync-nossl-test sync-nossl-test-not-ignored \
 	sync-fail-on-err-test sync-test-docs fmt fmt-check \
 	tokio-nativetls-clippy tokio-nossl-clippy tokio-rustlstls-clippy \
-	tokio-rustls-ring-clippy tokio-rustls-ring-test-not-ignored \
+	tokio-rustls-ring-clippy \
 	tokio-gzip-test-not-ignored sync-compress-test-not-ignored \
 	async-std-clippy-base async-std-clippy-native-tls async-std-clippy-rustls-tls
 
@@ -81,8 +82,8 @@ tokio-clippy: tokio-nativetls-clippy tokio-nossl-clippy tokio-rustlstls-clippy t
 async-std-clippy: async-std-clippy-base async-std-clippy-native-tls async-std-clippy-rustls-tls
 sync-clippy: sync-nativetls-clippy sync-nossl-clippy sync-rustlstls-clippy
 
-# Tokio library tests: native TLS, no TLS, and rustls with both crypto providers.
-tokio-test-not-ignored: tokio-nativetls-test-not-ignored tokio-nossl-test-not-ignored tokio-rustlstls-test-not-ignored tokio-rustls-ring-test-not-ignored tokio-gzip-test-not-ignored
+# Tokio library tests: native TLS, no TLS, and rustls.
+tokio-test-not-ignored: tokio-nativetls-test-not-ignored tokio-nossl-test-not-ignored tokio-rustlstls-test-not-ignored tokio-gzip-test-not-ignored
 tokio: tokio-test-not-ignored
 tokio-nativetls-test: tokio-nativetls-test-not-ignored
 tokio-nativetls-clippy:
@@ -109,10 +110,10 @@ tokio-rustlstls-test-not-ignored:
 tokio-rustlstls-test-ignored:
 	cargo test --no-default-features --features with-tokio --features tokio-rustls-tls --features aws-creds/http-credentials -- --ignored
 
+# `tokio-rustls-tls-ring` adds only a ring-backed TLS stack for credential fetches to
+# `tokio-rustls-tls`, which no library test reaches, so it is linted but not tested again.
 tokio-rustls-ring-clippy:
 	cargo clippy --no-default-features --features tokio-rustls-tls-ring --features aws-creds/http-credentials -- -D warnings
-tokio-rustls-ring-test-not-ignored:
-	cargo test --tests --examples --no-default-features --features tokio-rustls-tls-ring --features aws-creds/http-credentials
 
 # Any crate in a build can enable reqwest's decoders; the client must still return the bytes
 # the server sent, and ask for no others.
