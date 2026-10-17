@@ -156,7 +156,7 @@ after each run. This establishes MinIO page-API behavior; aggregate edge cases
 have local fixture coverage, and cloud-provider multipart pagination was not
 tested in this follow-up.
 
-### P2: Upload concurrency follows machine memory, not a caller budget — upper bound repaired
+### P2: Upload concurrency follows machine memory, not a caller budget — removed
 
 The original `calculate_max_concurrent_chunks` documented a maximum of 10 but
 clamped to 100. Each chunk is 8 MiB, so one upload could queue roughly 800 MiB of
@@ -191,6 +191,14 @@ each part in flight costs about twice its length and must be sent within
 `request_timeout`. This was checked with local wire fixtures at 64 KiB and 16 MiB
 parts and the unit tests of the heuristic, not against MinIO or with memory
 measurements.
+
+Follow-up (2026-10-17, later): the fanout is gone. A streamed upload sends one
+part at a time, as the downstream's own uploader has done in production: the
+chunk in hand is the only one in memory, a failed part or read finds nothing
+else in flight, and the heuristic, its `sysinfo` dependency and
+`with_max_concurrent_chunks` are removed with it. The fanout bought per-object
+throughput over a long, high-latency link; parallelism across objects is the
+caller's.
 
 ### P2: Retry policy lacks error and operation classification — repaired in source
 

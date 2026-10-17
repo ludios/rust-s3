@@ -98,25 +98,6 @@ pub async fn read_chunk_async<R: AsyncRead + Unpin + ?Sized>(
     Ok(chunk)
 }
 
-/// The chunks of `reader` as a stream, each `chunk_size` long but the last: a short one ends
-/// the stream after it, an empty one at once. Unlike a `read_chunk_async` future, the stream
-/// keeps a partly read chunk when the `next()` polling it is dropped, so a read can be raced
-/// against other work.
-#[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
-pub(crate) fn chunk_stream<R: AsyncRead + Unpin + ?Sized>(
-    reader: &mut R,
-    chunk_size: usize,
-) -> impl futures_util::Stream<Item = Result<Vec<u8>, S3Error>> + '_ {
-    futures_util::stream::try_unfold((reader, false), move |(reader, done)| async move {
-        if done {
-            return Ok(None);
-        }
-        let chunk = read_chunk_async(reader, chunk_size).await?;
-        let done = chunk.len() < chunk_size;
-        Ok((!chunk.is_empty()).then_some((chunk, (reader, done))))
-    })
-}
-
 pub trait GetAndConvertHeaders {
     fn get_and_convert<T: FromStr>(&self, header: &str) -> Option<T>;
     fn get_string(&self, header: &str) -> Option<String>;
