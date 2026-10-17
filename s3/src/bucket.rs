@@ -176,7 +176,8 @@ fn validate_success_xml_response(
                 depth -= 1;
             }
             Ok(Event::Text(text)) => {
-                if depth == 0 && !text.bytes().all(|b| b.is_ascii_whitespace()) {
+                // Only XML whitespace, which has no form feed, may surround the root.
+                if depth == 0 && !text.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
                     valid = false;
                     break;
                 }
@@ -5581,6 +5582,8 @@ mod test {
             "<?xml bogus?><CopyObjectResult/>",
             "<?xml version=\"1.0\"?><CopyObjectResult><?xml version=\"1.0\"?></CopyObjectResult>",
             "<CopyObjectResult><!-- invalid -- comment --></CopyObjectResult>",
+            "\u{c}<CopyObjectResult/>",
+            "<CopyObjectResult/>\u{c}",
         ] {
             assert!(
                 matches!(

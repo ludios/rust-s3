@@ -598,6 +598,8 @@ crate, so its redacted credential formatting is now exercised through `Bucket`.
 A synthetic sentinel regression checks both ordinary and pretty Debug output.
 The XML adapter preserves the previous text-normalization behavior and uses the
 new decoder-aware attribute API. The full `make ci` gate passed without warnings.
+Since quick-xml 0.42, whose reader validates UTF-8 itself and yields `&str`, the
+adapter no longer decodes text and checks attributes with `normalized_value`.
 
 An isolated fresh resolution audited against the same RustSec database
 `db663534ae858abb3fbad408a041ce04209c377f` reports 10 vulnerability matches across
