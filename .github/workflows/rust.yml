@@ -82,7 +82,7 @@ jobs:
       - name: Install garage for the end-to-end tests
         run: |
           mkdir -p "$HOME/.local/bin"
-          curl -sSfL -o "$HOME/.local/bin/garage" \
+          curl -sSfL --retry 3 -o "$HOME/.local/bin/garage" \
             https://garagehq.deuxfleurs.fr/_releases/v2.4.1/x86_64-unknown-linux-musl/garage
           echo "ae49f8de4aaee6b5ca305f7cbdccc8cd8a29b2804aac074649f18bfb83d0a2b6  $HOME/.local/bin/garage" \
             | sha256sum -c -

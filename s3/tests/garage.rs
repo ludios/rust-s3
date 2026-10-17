@@ -439,8 +439,9 @@ async fn multipart_upload_listing_pages_by_key_and_upload_id_markers() {
     assert_eq!(listed_at_once, created);
 }
 
-/// A GET returns the whole object; a ranged GET the inclusive range, cut at the object's
-/// end, or 416 when it starts past it; to a writer and, async, as a stream alike.
+/// A stored object exists; a GET returns it whole, and a ranged GET the inclusive range, cut
+/// at the object's end, or 416 when it starts past it; to a writer and, async, as a stream
+/// alike.
 #[maybe_async::test(feature = "sync", async(not(feature = "sync"), async_test))]
 async fn reads_return_the_whole_object_or_the_requested_range() {
     let garage = GarageServer::start();
@@ -457,6 +458,8 @@ async fn reads_return_the_whole_object_or_the_requested_range() {
     assert_eq!(status, 200);
     assert_eq!(head.content_length, Some(len as i64));
     assert_eq!(head.e_tag, Some(put_etag(&content)));
+    let exists = bucket.object_exists(AWKWARD_KEY).await.unwrap();
+    assert!(exists);
 
     let ranges: [(u64, Option<u64>, &[u8]); 5] = [
         (100, Some(1000), &content[100..=1000]),

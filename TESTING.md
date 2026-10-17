@@ -41,8 +41,9 @@ runtimes. Default Tokio native TLS covers it enabled for Tokio. Focused
 library-test commands also enable `fail-on-err` for async-std native TLS and
 sync native TLS, with the `request_retry_`, `xml_response_embedded_error_`,
 `multipart_stream_errors_attempt_abort_and_preserve_primary_error` and
-`bucket_policy_` filters. These checks cover retries, embedded response errors,
-multipart cleanup and bucket policies without repeating the full runtime matrix.
+`bucket_policy_` filters, and run the garage suite. These checks cover retries,
+embedded response errors, multipart cleanup, bucket policies and the garage
+end-to-end tests without repeating the full runtime matrix.
 
 Two `content_encoding` runs check that a download keeps the bytes the server
 sent when another crate enables a decoder: Tokio with reqwest's `gzip`,
@@ -60,10 +61,12 @@ at, and above the part length, with the part boundaries checked through the
 multipart ETag; builder headers; the abort after a failing source; manual
 multipart uploads, aborts, and listing pagination; whole, ranged, streamed, and
 writer reads, including a range past the end; single and bulk deletes; copies;
-headers on a single PUT; and object listing pages, partly on a key that needs
-percent-encoding. Garage accepts parts under 5 MiB, so the async configurations
-upload 256 KiB parts; sync uses its fixed 8 MiB. Garage has no object tagging,
-so tag readback is tested only against AWS.
+headers on a single PUT; and object listing pages. Manual multipart uploads,
+reads and copies use a key that needs percent-encoding. The `fail-on-err`
+commands above run the suite too. The `blocking` API has no garage coverage, as
+no configuration runs tests with it. Garage accepts parts under 5 MiB, so the
+async configurations upload 256 KiB parts; sync uses its fixed 8 MiB. Garage
+has no object tagging, so tag readback is tested only against AWS.
 
 ## GitHub workflow
 

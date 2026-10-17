@@ -4919,7 +4919,6 @@ mod test {
         }
     }
 
-    #[allow(dead_code)]
     #[derive(Clone, Copy, Debug)]
     enum MultipartFailureCase {
         Reader,
