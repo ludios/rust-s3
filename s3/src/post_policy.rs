@@ -111,7 +111,7 @@ impl<'a> PostPolicy<'a> {
 
     #[maybe_async::maybe_async]
     pub async fn sign(&self, bucket: Box<Bucket>) -> Result<PresignedPost, S3Error> {
-        use hmac::Mac;
+        use hmac::{KeyInit, Mac};
 
         bucket.credentials_refresh().await?;
         let now = now_utc();

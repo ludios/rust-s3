@@ -17,7 +17,7 @@ use crate::serde_types::{
 };
 use crate::signing;
 use awscreds::Credentials;
-use hmac::Mac;
+use hmac::{KeyInit, Mac};
 use http::HeaderMap;
 use http::header::{CONTENT_TYPE, HOST};
 use proptest::prelude::*;

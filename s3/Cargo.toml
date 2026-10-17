@@ -55,7 +55,7 @@ futures-util = { version = "0.3", optional = true, default-features = false, fea
     "alloc",
 ] }
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 http = "1"
 log = "0.4"
 maybe-async = { version = "0.2" }
@@ -71,7 +71,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 surf = { version = "2", optional = true, default-features = false }
 sysinfo = {version = "0.39", optional = true }
 thiserror = { version = "2", default-features = false }
