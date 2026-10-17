@@ -2192,6 +2192,9 @@ impl Bucket {
         ))
     }
 
+    /// Upload `reader` to `s3_path` with `content_type`: in one PUT when it is shorter than
+    /// `CHUNK_SIZE`, otherwise as a multipart upload of `CHUNK_SIZE`-long parts but the last,
+    /// one part at a time.
     #[maybe_async::sync_impl]
     fn _put_object_stream_with_content_type<R: Read + ?Sized>(
         &self,
@@ -2199,57 +2202,31 @@ impl Bucket {
         s3_path: &str,
         content_type: &str,
     ) -> Result<u16, S3Error> {
+        let first_chunk = crate::utils::read_chunk(reader)?;
+        if first_chunk.len() < CHUNK_SIZE {
+            let response_data =
+                self.put_object_with_content_type(s3_path, &first_chunk, content_type)?;
+            if response_data.status_code() >= 300 {
+                return Err(error_from_response_data(response_data)?);
+            }
+            return Ok(response_data.status_code());
+        }
+
         let msg = self.initiate_multipart_upload(s3_path, content_type)?;
         // Every later request names the key as the caller did, not as the server echoes it:
         // the request path drops a leading `/`, so an echoed "/" would lose its only character.
         let path = s3_path;
         let upload_id = &msg.upload_id;
 
-        let mut needs_abort = true;
+        // The upload ends with the first chunk shorter than `CHUNK_SIZE`, or with an empty read
+        // after a full one; the reader is not read past its end.
         let upload_result = (|| {
-            let mut part_number: u32 = 0;
-            let mut etags = Vec::new();
-            loop {
-                let chunk = crate::utils::read_chunk(reader)?;
-
-                if chunk.len() < CHUNK_SIZE {
-                    if part_number == 0 {
-                        // Files is not big enough for multipart upload, going with regular put_object.
-                        // The upload is already aborted, so a fallback PUT error must not abort again.
-                        needs_abort = false;
-                        self.abort_upload(path, upload_id)?;
-                        return Ok(self.put_object(s3_path, chunk.as_slice())?.status_code());
-                    }
-
-                    part_number += 1;
-                    let response_data = self.make_multipart_request(
-                        path,
-                        chunk,
-                        part_number,
-                        upload_id,
-                        content_type,
-                        &HeaderMap::new(),
-                    )?;
-                    let part = part_from_response(response_data, part_number)?;
-                    etags.push(part.etag);
-                    let inner_data = etags
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, x)| Part {
-                            etag: x,
-                            part_number: i as u32 + 1,
-                        })
-                        .collect::<Vec<Part>>();
-                    let response_data =
-                        self.complete_multipart_upload(path, upload_id, inner_data)?;
-                    if !(200..300).contains(&response_data.status_code()) {
-                        return Err(response_error_from_data(response_data));
-                    }
-                    return Ok(response_data.status_code());
-                }
-
-                part_number += 1;
-                let response_data = self.make_multipart_request(
+            let mut parts = Vec::new();
+            let mut chunk = first_chunk;
+            while !chunk.is_empty() {
+                let part_number = parts.len() as u32 + 1;
+                let last = chunk.len() < CHUNK_SIZE;
+                let response = self.make_multipart_request(
                     path,
                     chunk,
                     part_number,
@@ -2257,18 +2234,23 @@ impl Bucket {
                     content_type,
                     &HeaderMap::new(),
                 )?;
-                let part = part_from_response(response_data, part_number)?;
-                etags.push(part.etag);
+                parts.push(part_from_response(response, part_number)?);
+                chunk = if last {
+                    Vec::new()
+                } else {
+                    crate::utils::read_chunk(reader)?
+                };
             }
+            let response_data = self.complete_multipart_upload(path, upload_id, parts)?;
+            if !(200..300).contains(&response_data.status_code()) {
+                return Err(response_error_from_data(response_data));
+            }
+            Ok(response_data.status_code())
         })();
 
-        match upload_result {
-            Ok(status_code) => Ok(status_code),
-            Err(error) if needs_abort => {
-                self.abort_upload_after_failure(path, upload_id, &HeaderMap::new(), error)
-            }
-            Err(error) => Err(error),
-        }
+        upload_result.or_else(|error| {
+            self.abort_upload_after_failure(path, upload_id, &HeaderMap::new(), error)
+        })
     }
 
     /// Initiate multipart upload to s3.
@@ -5083,7 +5065,12 @@ mod test {
             } else {
                 1
             };
-            let mut steps = vec![("POST ", "uploads", 200, init_body, false)];
+            // An object shorter than a chunk goes up in one PUT, without a multipart upload.
+            let mut steps = if matches!(case, MultipartFailureCase::SmallPut) {
+                Vec::new()
+            } else {
+                vec![("POST ", "uploads", 200, init_body, false)]
+            };
             match case {
                 MultipartFailureCase::Reader | MultipartFailureCase::Abort => {
                     steps.push(("PUT ", "partNumber=1", 200, "", true));
@@ -5096,7 +5083,6 @@ mod test {
                     steps.push(("DELETE ", "uploadId=upload-id", status, body, false));
                 }
                 MultipartFailureCase::SmallPut => {
-                    steps.push(("DELETE ", "uploadId=upload-id", 204, "", false));
                     // Ordinary PUT is also not replayed after an ambiguous failure.
                     steps.push(("PUT ", "multipart-test", 500, put_failure, false));
                 }
@@ -5109,9 +5095,6 @@ mod test {
                 MultipartFailureCase::Completion
                 | MultipartFailureCase::CompletionEmbeddedError => {
                     steps.push(("PUT ", "partNumber=1", 200, "", true));
-                    if cfg!(feature = "sync") {
-                        steps.push(("PUT ", "partNumber=2", 200, "", true));
-                    }
                     let (status, body) = if matches!(case, MultipartFailureCase::Completion) {
                         (500, completion_failure)
                     } else {
@@ -5324,7 +5307,6 @@ mod test {
             MultipartFailureCase::Completion,
             MultipartFailureCase::CompletionEmbeddedError,
             MultipartFailureCase::Abort,
-            #[cfg(feature = "sync")]
             MultipartFailureCase::SmallPut,
         ] {
             let (result, requests) = run_multipart_failure_case(case).await;
@@ -5336,17 +5318,13 @@ mod test {
             let expected_requests = match case {
                 MultipartFailureCase::Reader => 3,
                 MultipartFailureCase::Part => 2 + failure_attempts,
-                MultipartFailureCase::Completion => 4 + usize::from(cfg!(feature = "sync")),
-                MultipartFailureCase::CompletionEmbeddedError => {
-                    4 + usize::from(cfg!(feature = "sync"))
-                }
+                MultipartFailureCase::Completion => 4,
+                MultipartFailureCase::CompletionEmbeddedError => 4,
                 MultipartFailureCase::Abort => 3,
-                MultipartFailureCase::SmallPut => 3,
+                MultipartFailureCase::SmallPut => 1,
             };
             assert_eq!(requests.len(), expected_requests);
-            if !matches!(case, MultipartFailureCase::SmallPut) {
-                assert!(result.is_err(), "{case:?} should return an error");
-            }
+            assert!(result.is_err(), "{case:?} should return an error");
 
             match case {
                 MultipartFailureCase::Reader | MultipartFailureCase::Abort => {
@@ -5354,7 +5332,7 @@ mod test {
                         matches!(result, Err(S3Error::Io(error)) if error.to_string() == "injected reader failure")
                     );
                 }
-                MultipartFailureCase::Part => {
+                MultipartFailureCase::Part | MultipartFailureCase::SmallPut => {
                     assert!(matches!(
                         result,
                         Err(S3Error::HttpFail | S3Error::HttpFailWithBody(500, _))
@@ -5371,16 +5349,6 @@ mod test {
                     assert!(
                         matches!(result, Err(S3Error::HttpFailWithBody(200, body)) if body.contains("completion-req"))
                     );
-                }
-                MultipartFailureCase::SmallPut => {
-                    if cfg!(feature = "fail-on-err") {
-                        assert!(matches!(
-                            result,
-                            Err(S3Error::HttpFail | S3Error::HttpFailWithBody(500, _))
-                        ));
-                    } else {
-                        assert!(matches!(result, Ok(500)));
-                    }
                 }
             }
         }
