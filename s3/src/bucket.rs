@@ -1918,6 +1918,7 @@ impl Bucket {
     ///     .with_content_type("application/zip")
     ///     .with_cache_control("public, max-age=3600")?
     ///     .with_metadata("uploaded-by", "stream-builder")?
+    ///     .with_chunk_size(16 * 1024 * 1024)
     ///     .with_max_concurrent_chunks(2)
     ///     .execute_stream(&mut file)
     ///     .await?;
@@ -2079,7 +2080,7 @@ impl Bucket {
             content_type,
             None,
             None,
-            None,
+            CHUNK_SIZE,
         )
         .await
     }
@@ -2101,6 +2102,8 @@ impl Bucket {
         (available_memory / memory_per_chunk).clamp(2, MAX_CONCURRENT_CHUNKS as u64) as usize
     }
 
+    /// `max_concurrent_chunks_for_memory` for chunks of `chunk_size` bytes and the memory
+    /// available on this machine now.
     #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
     fn calculate_max_concurrent_chunks(chunk_size: usize) -> usize {
         // Create a new System instance and refresh memory info
@@ -2117,7 +2120,7 @@ impl Bucket {
     /// chunk, otherwise as a multipart upload of chunk-long parts but the last. `custom_headers`
     /// are routed per request as `PutObjectStreamRequest` documents. `max_concurrent_chunks`
     /// caps the parts in flight, by default 2–10 from available memory; `chunk_size` is the
-    /// part length, by default `CHUNK_SIZE`.
+    /// nonzero part length.
     #[maybe_async::async_impl]
     pub(crate) async fn _put_object_stream_with_content_type_and_headers<
         R: AsyncRead + Unpin + ?Sized,
@@ -2128,9 +2131,8 @@ impl Bucket {
         content_type: &str,
         custom_headers: Option<http::HeaderMap>,
         max_concurrent_chunks: Option<std::num::NonZeroUsize>,
-        chunk_size: Option<std::num::NonZeroUsize>,
+        chunk_size: usize,
     ) -> Result<PutStreamResponse, S3Error> {
-        let chunk_size = chunk_size.map_or(CHUNK_SIZE, std::num::NonZeroUsize::get);
         let first_chunk = crate::utils::read_chunk_async(reader, chunk_size).await?;
         if first_chunk.len() < chunk_size {
             let total_size = first_chunk.len();
@@ -3546,8 +3548,9 @@ impl Bucket {
     /// request is handed to the HTTP client, connecting and sending the request body
     /// included, and then to each wait for the next chunk of the response body. A transfer
     /// that keeps moving never times out, however large the object; a single `put_object`
-    /// must still upload its whole body within the limit, which `put_object_stream` avoids
-    /// by sending parts. A timeout surfaces as `S3Error::Io` of kind `TimedOut`; one while
+    /// must still upload its whole body within the limit, as must each part that
+    /// `put_object_stream` sends (8 MiB unless `with_chunk_size` says otherwise). A timeout
+    /// surfaces as `S3Error::Io` of kind `TimedOut`; one while
     /// waiting for the headers is retried like other transient failures.
     ///
     /// The synchronous backend maps the limit onto its transport's connect and read
@@ -5028,30 +5031,33 @@ mod test {
         )
     )]
     async fn multipart_stream_builder_chunk_size_sets_threshold_and_part_length() {
-        const CHUNK: usize = 64 * 1024;
-        for (size, expected_parts) in [
-            (CHUNK - 1, vec![]),
-            (CHUNK, vec![(1, CHUNK)]),
-            (CHUNK + 1, vec![(1, CHUNK), (2, 1)]),
-        ] {
-            let (result, server_result) =
-                run_multipart_header_case(size, false, HeaderMap::new(), CHUNK).await;
-            assert!(result.is_ok(), "stream upload failed: {result:?}");
-            let requests = server_result.expect("local HTTP fixture failed");
-            let lines = requests
-                .iter()
-                .map(|request| request.line.as_str())
-                .collect::<Vec<_>>();
-            if expected_parts.is_empty() {
-                assert_eq!(requests.len(), 1, "{lines:?}");
-                assert!(
-                    requests[0].line.starts_with("PUT ") && !requests[0].line.contains('?'),
-                    "{lines:?}"
-                );
-                assert_eq!(requests[0].content_length, size);
-            } else {
-                assert_eq!(requests.len(), expected_parts.len() + 2, "{lines:?}");
-                assert_eq!(part_numbers_and_lengths(&requests), expected_parts);
+        // A chunk shorter than the default and one longer, which reads capped at the
+        // default would split.
+        for chunk in [64 * 1024, 2 * super::CHUNK_SIZE] {
+            for (size, expected_parts) in [
+                (chunk - 1, vec![]),
+                (chunk, vec![(1, chunk)]),
+                (chunk + 1, vec![(1, chunk), (2, 1)]),
+            ] {
+                let (result, server_result) =
+                    run_multipart_header_case(size, false, HeaderMap::new(), chunk).await;
+                assert!(result.is_ok(), "chunk {chunk}, size {size}: {result:?}");
+                let requests = server_result.expect("local HTTP fixture failed");
+                let lines = requests
+                    .iter()
+                    .map(|request| request.line.as_str())
+                    .collect::<Vec<_>>();
+                if expected_parts.is_empty() {
+                    assert_eq!(requests.len(), 1, "{lines:?}");
+                    assert!(
+                        requests[0].line.starts_with("PUT ") && !requests[0].line.contains('?'),
+                        "{lines:?}"
+                    );
+                    assert_eq!(requests[0].content_length, size);
+                } else {
+                    assert_eq!(requests.len(), expected_parts.len() + 2, "{lines:?}");
+                    assert_eq!(part_numbers_and_lengths(&requests), expected_parts);
+                }
             }
         }
     }

@@ -237,7 +237,7 @@ pub struct PutObjectStreamRequest<'a> {
     content_type: String,
     custom_headers: HeaderMap,
     max_concurrent_chunks: Option<std::num::NonZeroUsize>,
-    chunk_size: Option<std::num::NonZeroUsize>,
+    chunk_size: usize,
 }
 
 #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
@@ -250,7 +250,7 @@ impl<'a> PutObjectStreamRequest<'a> {
             content_type: "application/octet-stream".to_string(),
             custom_headers: HeaderMap::new(),
             max_concurrent_chunks: None,
-            chunk_size: None,
+            chunk_size: crate::bucket::CHUNK_SIZE,
         }
     }
 
@@ -337,13 +337,19 @@ impl<'a> PutObjectStreamRequest<'a> {
     /// other as a multipart upload. A value of `0` restores the default, `CHUNK_SIZE`
     /// (8 MiB).
     ///
-    /// Each part in flight is buffered whole, plus one copy for the request body, so an
-    /// upload holds about twice this length times its concurrency cap; the automatic cap
-    /// shrinks as this grows, down to 2. S3 refuses parts under 5 MiB except the last,
-    /// caps a part at 5 GiB, and allows 10,000 parts, so this length times 10,000 bounds
-    /// an object; other services differ.
+    /// Each chunk is allocated at this length up front and buffered whole, plus one copy
+    /// for the request body, so an upload holds about twice this length times its
+    /// concurrency cap (up to three times on async-std, whose `read_to_end` zero-fills
+    /// and may double the buffer); the automatic cap shrinks as this grows, down to 2.
+    /// Each part, and a single PUT, must be sent within the bucket's `request_timeout`.
+    /// S3 refuses parts under 5 MiB except the last, caps a part at 5 GiB, and allows
+    /// 10,000 parts, so this length times 10,000 bounds an object; other services differ.
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.chunk_size = std::num::NonZeroUsize::new(chunk_size);
+        self.chunk_size = if chunk_size == 0 {
+            crate::bucket::CHUNK_SIZE
+        } else {
+            chunk_size
+        };
         self
     }
 
@@ -462,17 +468,19 @@ mod tests {
     #[cfg(any(feature = "with-tokio", feature = "with-async-std"))]
     #[test]
     fn stream_builder_chunk_size_defaults_and_resets_to_default() {
+        use crate::bucket::CHUNK_SIZE;
         let bucket =
             Bucket::new("test", Region::UsEast1, Credentials::anonymous().unwrap()).unwrap();
 
-        assert_eq!(bucket.put_object_stream_builder("/stream").chunk_size, None);
+        assert_eq!(
+            bucket.put_object_stream_builder("/stream").chunk_size,
+            CHUNK_SIZE
+        );
         assert_eq!(
             bucket
                 .put_object_stream_builder("/stream")
                 .with_chunk_size(300_000_000)
-                .chunk_size
-                .unwrap()
-                .get(),
+                .chunk_size,
             300_000_000
         );
         assert_eq!(
@@ -481,7 +489,7 @@ mod tests {
                 .with_chunk_size(300_000_000)
                 .with_chunk_size(0)
                 .chunk_size,
-            None
+            CHUNK_SIZE
         );
     }
 
