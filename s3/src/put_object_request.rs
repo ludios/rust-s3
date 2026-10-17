@@ -213,10 +213,9 @@ impl<'a> PutObjectRequest<'a> {
 /// Builder for streaming PUT operations.
 ///
 /// If an error is returned after multipart initiation, the upload is aborted on
-/// a best-effort basis, bounded by the default 60-second `request_timeout` when
-/// the bucket sets none. Cancelling the future cannot run an asynchronous abort,
-/// and a part already sent or a lost completion response can leave remote state
-/// uncertain.
+/// a best-effort basis, under the default `request_timeout` if the bucket has
+/// none. Cancelling the future cannot run an asynchronous abort, and a part
+/// already sent or a lost completion response can leave remote state uncertain.
 ///
 /// On multipart uploads, headers supplied to this builder are routed by request:
 /// object metadata and other custom headers are sent at initiation, SSE-C headers

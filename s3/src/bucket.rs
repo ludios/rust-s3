@@ -1991,9 +1991,9 @@ impl Bucket {
     /// # Ok(())
     /// # }
     /// ```
-    /// After multipart initiation, returned errors trigger a best-effort abort, bounded
-    /// by the default 60-second `request_timeout` when the bucket sets none. Cancelling the operation or losing the completion response can leave the
-    /// remote upload outcome uncertain.
+    /// After multipart initiation, returned errors trigger a best-effort abort, under the
+    /// default `request_timeout` if the bucket has none. Cancelling the operation or
+    /// losing the completion response can leave the remote upload outcome uncertain.
     #[maybe_async::async_impl]
     pub async fn put_object_stream_with_content_type<R: AsyncRead + Unpin>(
         &self,
@@ -2051,7 +2051,7 @@ impl Bucket {
         // the abort fails (for example, if completion already reached S3).
         log::warn!("multipart upload {upload_id} to {path}: aborting after {error}");
         let mut bucket = self.with_overlaid_extra_headers(abort_headers);
-        // Even when the caller lifted the limit for long uploads, a silent server must not
+        // Even when the caller removed the limit for long uploads, a silent server must not
         // hold back `error`; the abort sends no body for the default limit to cut off.
         bucket.request_timeout = bucket.request_timeout.or(DEFAULT_REQUEST_TIMEOUT);
         if let Err(abort_error) = bucket.abort_upload(path, upload_id).await {
@@ -3464,7 +3464,9 @@ impl Bucket {
     }
 
     /// Configure how long a request may wait on the server without progress, or `None`
-    /// for no limit. Defaults to 60 seconds.
+    /// for no limit. Defaults to 60 seconds. Under `None`, the abort after a failed
+    /// `put_object_stream` still uses the default: it sends no body, and a silent server
+    /// must not hold back the upload's error.
     ///
     /// The limit applies, per attempt, to the wait for the response headers after the
     /// request is handed to the HTTP client, connecting and sending the request body

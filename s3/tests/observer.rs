@@ -1,4 +1,5 @@
 // Model-output: Claude Fable 5.1
+// Model-output: Claude Opus 5.5
 
 //! Exercises the `RequestObserver` hook end to end: public `Bucket` methods against the fake S3
 //! of `fake_s3`, with one recording observer installed.
@@ -29,6 +30,7 @@ enum Event {
         op: u64,
         attempt: u32,
         bucket: String,
+        request_timeout: Option<Duration>,
         method: String,
         url: String,
     },
@@ -77,6 +79,7 @@ impl RequestObserver for Recorder {
             op,
             attempt,
             bucket: bucket.name(),
+            request_timeout: bucket.request_timeout(),
             method: request.method().to_string(),
             url: request.url().to_string(),
         });
@@ -175,11 +178,13 @@ fn op_of(events: &[Event]) -> u64 {
     op
 }
 
+/// A request from `fake_s3::bucket`, which keeps the default `request_timeout`.
 fn request(op: u64, attempt: u32, method: &str, endpoint: &str, path: &str) -> Event {
     Event::Request {
         op,
         attempt,
         bucket: BUCKET.to_owned(),
+        request_timeout: Some(Duration::from_secs(60)),
         method: method.to_owned(),
         url: format!("{endpoint}/{BUCKET}{path}"),
     }
@@ -523,4 +528,52 @@ async fn a_send_failure_is_reported_per_attempt_with_no_body_events() {
         ]
     };
     assert_eq!(events, [attempt(1), attempt(2)].concat());
+}
+
+#[tokio::test]
+async fn a_failed_stream_upload_aborts_under_the_default_timeout_when_the_bucket_has_none() {
+    let _scenario = begin().await;
+    let initiate = b"<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>up</Key><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>";
+    let (endpoint, server) = serve(vec![
+        reply(http("200 OK", &[], initiate)),
+        reply(http("200 OK", &[("etag", "\"part-etag\"")], b"")),
+        reply(http("500 Internal Server Error", &[], XML_ERROR)),
+        reply(http("204 No Content", &[], b"")),
+    ])
+    .await;
+    let mut bucket = bucket(&endpoint);
+    bucket.set_request_timeout(None);
+
+    // One full part, then the completion fails.
+    let result = within(
+        bucket
+            .put_object_stream_builder("/up")
+            .with_chunk_size(4)
+            .execute_stream(&mut &b"data"[..]),
+    )
+    .await;
+    within(server).await.unwrap();
+
+    assert!(result.is_err(), "{result:?}");
+    let timeouts: Vec<(String, Option<Duration>)> = take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Request {
+                method,
+                request_timeout,
+                ..
+            } => Some((method, request_timeout)),
+            _ => None,
+        })
+        .collect();
+    let expected = [
+        ("POST", None),
+        ("PUT", None),
+        ("POST", None),
+        ("DELETE", Some(Duration::from_secs(60))),
+    ];
+    assert_eq!(
+        timeouts,
+        expected.map(|(method, timeout)| (method.to_owned(), timeout))
+    );
 }
