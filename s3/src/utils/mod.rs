@@ -116,9 +116,26 @@ impl GetAndConvertHeaders for http::header::HeaderMap {
     }
 }
 
+/// The count in the header `name` of `headers`, such as `Content-Length`: `None` unless every
+/// field of it is the same run of ASCII digits, so that a sign, a blank or a second, differing
+/// field is no count rather than a misread one.
+fn get_count(headers: &http::HeaderMap, name: &str) -> Option<i64> {
+    let mut fields = headers.get_all(name).iter();
+    let first = fields.next()?;
+    if fields.any(|field| field != first) {
+        return None;
+    }
+    let digits = first.to_str().ok()?;
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// The fields of a HEAD response's `headers`. A field is `None` when its header is missing, is
-/// not visible ASCII, or does not parse as the field's type: a malformed `Content-Length` is no
-/// length, not a length of 0. `metadata` holds the visible-ASCII `x-amz-meta-*` headers.
+/// not visible ASCII, or does not parse as the field's type, and a count when `get_count` finds
+/// none: a malformed `Content-Length` is no length, not a length of 0. `metadata` holds the
+/// visible-ASCII `x-amz-meta-*` headers.
 impl From<&http::HeaderMap> for HeadObjectResult {
     fn from(headers: &http::HeaderMap) -> Self {
         let metadata = headers
@@ -134,7 +151,7 @@ impl From<&http::HeaderMap> for HeadObjectResult {
             content_disposition: headers.get_string("Content-Disposition"),
             content_encoding: headers.get_string("Content-Encoding"),
             content_language: headers.get_string("Content-Language"),
-            content_length: headers.get_and_convert("Content-Length"),
+            content_length: get_count(headers, "Content-Length"),
             content_type: headers.get_string("Content-Type"),
             delete_marker: headers.get_and_convert("x-amz-delete-marker"),
             e_tag: headers.get_string("ETag"),
@@ -142,12 +159,12 @@ impl From<&http::HeaderMap> for HeadObjectResult {
             expires: headers.get_string("Expires"),
             last_modified: headers.get_string("Last-Modified"),
             metadata: Some(metadata),
-            missing_meta: headers.get_and_convert("x-amz-missing-meta"),
+            missing_meta: get_count(headers, "x-amz-missing-meta"),
             object_lock_legal_hold_status: headers.get_string("x-amz-object-lock-legal-hold"),
             object_lock_mode: headers.get_string("x-amz-object-lock-mode"),
             object_lock_retain_until_date: headers
                 .get_string("x-amz-object-lock-retain-until-date"),
-            parts_count: headers.get_and_convert("x-amz-mp-parts-count"),
+            parts_count: get_count(headers, "x-amz-mp-parts-count"),
             replication_status: headers.get_string("x-amz-replication-status"),
             request_charged: headers.get_string("x-amz-request-charged"),
             restore: headers.get_string("x-amz-restore"),
@@ -227,6 +244,7 @@ macro_rules! retry {
 
 #[cfg(test)]
 mod test {
+    use crate::serde_types::HeadObjectResult;
     use crate::utils::etag_for_path;
     use std::fs::File;
     use std::io::Cursor;
@@ -330,5 +348,66 @@ mod test {
 
         let result = super::read_chunk(&mut blob).unwrap();
         assert_eq!(result.len(), 1_611_392);
+    }
+
+    /// The HEAD result of a response whose headers are `fields`, in order.
+    fn head(fields: &[(&'static str, &'static str)]) -> HeadObjectResult {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in fields {
+            headers.append(*name, http::HeaderValue::from_static(value));
+        }
+        HeadObjectResult::from(&headers)
+    }
+
+    #[test]
+    fn head_content_length_is_only_agreeing_digits() {
+        let length = |fields: &[(&'static str, &'static str)]| head(fields).content_length;
+        assert_eq!(length(&[("content-length", "1234")]), Some(1234));
+        assert_eq!(
+            length(&[("content-length", "0"), ("content-length", "0")]),
+            Some(0)
+        );
+        assert_eq!(length(&[]), None);
+        for malformed in [
+            "",
+            "12x",
+            "+0",
+            "-0",
+            "-5",
+            " 5",
+            "5, 5",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                length(&[("content-length", malformed)]),
+                None,
+                "{malformed:?}"
+            );
+        }
+        assert_eq!(
+            length(&[("content-length", "0"), ("content-length", "1234")]),
+            None
+        );
+    }
+
+    #[test]
+    fn head_counts_and_booleans_that_do_not_parse_are_absent() {
+        let well_formed = head(&[
+            ("x-amz-mp-parts-count", "3"),
+            ("x-amz-missing-meta", "2"),
+            ("x-amz-delete-marker", "true"),
+        ]);
+        assert_eq!(well_formed.parts_count, Some(3));
+        assert_eq!(well_formed.missing_meta, Some(2));
+        assert_eq!(well_formed.delete_marker, Some(true));
+
+        let malformed = head(&[
+            ("x-amz-mp-parts-count", "many"),
+            ("x-amz-missing-meta", "-2"),
+            ("x-amz-delete-marker", "yes"),
+        ]);
+        assert_eq!(malformed.parts_count, None);
+        assert_eq!(malformed.missing_meta, None);
+        assert_eq!(malformed.delete_marker, None);
     }
 }
