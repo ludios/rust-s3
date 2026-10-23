@@ -10,9 +10,11 @@ checks      = ["cargo"]
 
 # Environment
 
-Welcome. You're on NixOS 26.05 and many things are already installed, including:
+Welcome. You're on NixOS 26.05; many things are installed, including:
 
 ripgrep, ripgrep-all, node, deno, pnpm, oxfmt, oxlint, jq, python3, uv, garage, psql, ephemeralpg (bin: pg_tmp), google-chrome, curl-impersonate, gcc, go, rustc, cargo, patchelf, zip, unzip, zstd, dmesg, perf, hyperfine, codex, claude.
+
+Your `Bash` tool runs zsh here, not bash.
 
 Before starting or resuming work, check what `hostname` outputs.
 
