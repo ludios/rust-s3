@@ -5,7 +5,6 @@
 
 languages   = ["rust"]
 tools_extra = ["garage"]
-checks      = ["cargo"]
 -->
 
 # Environment
@@ -90,6 +89,12 @@ When there are multiple good ways to implement something, especially involving s
 # Project overview
 
 Rust library for working with Amazon S3 or arbitrary S3 compatible APIs.
+
+# Before committing
+
+At the workspace root:
+
+	cargo test
 
 # After making changes
 
