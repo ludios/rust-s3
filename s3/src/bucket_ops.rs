@@ -1,3 +1,5 @@
+// Model-output: Claude Opus 5.5
+
 //! This module provides utilities for configuring and managing Amazon S3 buckets, focusing on access control, bucket configuration, and handling responses from the S3 service.
 //! It includes structures for defining bucket access policies (both canned and custom), configuring various bucket properties, and parsing responses from S3 API calls like `ListBuckets`.
 //!
@@ -51,7 +53,7 @@ pub enum CannedBucketAcl {
 }
 
 use http::HeaderMap;
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
 use std::fmt;
 
 impl fmt::Display for CannedBucketAcl {
@@ -193,7 +195,7 @@ impl BucketConfiguration {
         if self.object_lock_enabled {
             headers.insert(
                 HeaderName::from_static("x-amz-bucket-object-lock-enabled"),
-                "Enabled".to_string().parse()?,
+                HeaderValue::from_static("true"),
             );
         }
         if let Some(ref value) = self.grant_full_control {
@@ -351,5 +353,28 @@ mod list_buckets {
             );
             assert_eq!(parsed.buckets.bucket.len(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The value of the object-lock header that `configuration` adds to a CreateBucket
+    /// request, or `None` if it adds no such header
+    fn object_lock_header(configuration: &BucketConfiguration) -> Option<String> {
+        let mut headers = HeaderMap::new();
+        configuration.add_headers(&mut headers).unwrap();
+        headers
+            .get("x-amz-bucket-object-lock-enabled")
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn object_lock_header_is_the_boolean_true() {
+        let locked = BucketConfiguration::new(None, true, None, None, None, None, None, None);
+        assert_eq!(object_lock_header(&locked).as_deref(), Some("true"));
+        assert_eq!(object_lock_header(&BucketConfiguration::private()), None);
+        assert_eq!(object_lock_header(&BucketConfiguration::public()), None);
     }
 }
